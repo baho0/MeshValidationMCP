@@ -1,136 +1,129 @@
 # MeshValidationMCP
 
-An MCP (Model Context Protocol) server that lets coding agents **validate 3D mesh
-manipulations** — with deterministic geometric checks *and* multi-view visual renders.
+An [MCP](https://modelcontextprotocol.io) server for validating 3D mesh manipulations.
+It combines deterministic geometric checks with multi-view rendered feedback, giving
+coding agents a reliable way to verify their own mesh-processing code.
 
-The intended loop: an agent writes mesh-manipulation code, exports the result, then calls
-`validate_mesh` with the file path and its structured expectations. The server returns a
-per-check pass/fail report **plus** a rendered contact sheet, so a vision-capable agent
-verifies the result both numerically and visually before moving on.
+## Overview
 
-## Quickstart
+Testing geometry code is hard: unit tests may pass while the result is visibly wrong.
+This server closes that gap. An agent writes mesh-manipulation code, exports the result,
+and calls `validate_mesh` with the file path and its expected properties. The server
+returns a per-check pass/fail report together with rendered views, so the agent can
+confirm the result both numerically and visually — and fix its own mistakes before
+reporting back.
 
-Requires [uv](https://docs.astral.sh/uv/) (`pacman -S uv` on Arch, or
-`curl -LsSf https://astral.sh/uv/install.sh | sh`). uv provisions the pinned Python
-(3.13) and the virtualenv automatically:
-
-```bash
-uv sync          # install deps
-uv run pytest    # 51 tests
+```
+write code → export mesh → validate_mesh → inspect report + renders → fix → repeat
 ```
 
-### Register with Claude Code
+## Features
 
-The repo ships a project-scoped [.mcp.json](.mcp.json) — opening Claude Code inside this
-repo picks the server up automatically (adjust the `--directory` path if you cloned
-elsewhere). To register it globally instead:
+- **Deterministic validation** — volume, surface area, bounding box, centroid,
+  vertex/face counts, watertightness, body count and Euler number, with global and
+  per-check tolerances
+- **Visual feedback** — labeled multi-view contact sheets with axis gizmos, returned as
+  images in the tool result
+- **Transform detection** — compares before/after meshes and classifies the change
+  (`identical | translation | rotation | rigid | similarity | mirrored | deformed`),
+  reporting translation vector, rotation axis/angle and uniform scale
+- **Distance metrics** — sampled chamfer and Hausdorff distances, plus a displacement
+  heatmap render
+- **Agent-friendly errors** — failures return a structured JSON envelope
+  (`{"code", "message", "hint"}`) the caller can parse and act on
+- **Deterministic output** — fixed seeds, cameras and lighting; identical inputs produce
+  identical reports
+
+Supported formats: STL, OBJ, PLY, GLB/glTF, OFF, 3MF.
+
+## Requirements
+
+- [uv](https://docs.astral.sh/uv/) — provisions the pinned Python (3.13) and all
+  dependencies automatically
+
+## Installation
 
 ```bash
-claude mcp add mesh-validator -- uv run --directory /path/to/MeshValidationMCP mesh-validation-mcp
+git clone https://github.com/baho0/MeshValidationMCP.git
+cd MeshValidationMCP
+uv sync
+uv run pytest   # optional: verify the installation
+```
+
+### Registering with Claude Code
+
+The repository ships a project-scoped [`.mcp.json`](.mcp.json); opening Claude Code
+inside the repo picks the server up automatically. To register it globally:
+
+```bash
+claude mcp add mesh-validator --scope user -- \
+  uv run --directory /path/to/MeshValidationMCP mesh-validation-mcp
 ```
 
 ## Tools
 
-All file paths must be **absolute**. All values are in the **file's native units**.
-Supported formats: STL, OBJ, PLY, GLB/glTF, OFF, 3MF.
+| Tool | Purpose |
+|------|---------|
+| `validate_mesh(file_path, expectations, include_render?)` | Check a mesh against structured expectations; returns a pass/fail report and a 4-view render |
+| `inspect_mesh(file_path)` | Full geometric report — use it to ground truth a mesh before writing expectations |
+| `render_mesh(file_path, views?, style?, resolution?, combine?)` | Render canonical views (`iso`, `front`, `top`, ...) without running checks |
+| `compare_meshes(file_a, file_b, sample_count?, include_render?)` | Detect and classify the transform between two meshes; distances, metric deltas and a displacement heatmap |
 
-### `validate_mesh(file_path, expectations, include_render=true)`
+All file paths must be absolute. All values are interpreted in the file's native units.
+Renders use a Z-up convention: `front` looks along +Y, `iso` views from the (+X, −Y, +Z)
+octant.
 
-The core hybrid tool: checks the mesh against structured expectations, returns a
-deterministic report and (by default) a 4-view render sheet.
+### Expectations example
 
-```jsonc
-// expectations example
+```json
 {
-  "volume": 500,                                  // bare value -> global tolerance
+  "volume": 500,
   "surface_area": {"expected": 400, "rel_tol": 0.02},
   "bbox_extents": [10, 10, 5],
-  "vertex_count": {"min": 6, "max": 9},           // counts: exact int or min/max range
+  "vertex_count": {"min": 6, "max": 9},
   "watertight": true,
-  "body_count": 1,
-  "tolerance": {"relative": 0.01, "absolute": null}  // global default: 1% relative
+  "tolerance": {"relative": 0.01}
 }
 ```
 
-Supported keys: `volume`, `surface_area`, `bbox_min`, `bbox_max`, `bbox_extents`,
-`centroid` (scalar/vector with tolerances) · `vertex_count`, `face_count` (exact or
-range) · `watertight`, `winding_consistent`, `body_count`, `euler_number` (exact) ·
-`tolerance` (global). Pass rule: `|actual - expected| <= max(abs_tol, rel_tol*|expected|)`.
-
-Response: `{"passed", "summary", "checks": [{name, passed, expected, actual, deviation,
-deviation_pct, tolerance, caveats}], "mesh", "render"}` + a PNG image block.
-
-### `inspect_mesh(file_path)`
-
-Full geometric report (counts, watertightness, volume + `volume_reliable` flag, bounds,
-per-body breakdown, caveats). Use it to ground truth a mesh before writing expectations.
-
-### `render_mesh(file_path, views?, style?, resolution?, combine?)`
-
-Visual-only. Views: `iso, iso_back, front, back, left, right, top, bottom` (≤6 per
-sheet). Styles: `shaded`, `shaded_edges`, `wireframe`. Tiles carry the view label and an
-RGB axis gizmo (X=red, Y=green, Z=blue); multi-body meshes get one tint per body.
-
-### `compare_meshes(file_a, file_b, sample_count?, include_render?)`
-
-Before/after comparison: detects the transform (translation vector, rotation axis+angle,
-uniform scale) via exact vertex correspondence when topology matches (Umeyama/procrustes)
-or ICP otherwise, classifies the change
-(`identical | translation | rotation | rigid | similarity | mirrored | deformed`), and
-reports chamfer/Hausdorff distances plus metric deltas. Mirroring is detected explicitly
-(reflected fits are tried when no proper transform explains B), so `mirror()`-style
-manipulations are verifiable too. The optional render paints B as a displacement heatmap
-(viridis + colorbar).
-
-### Errors
-
-Tool failures return a parseable JSON envelope:
-`{"code": "FILE_NOT_FOUND", "message": "...", "hint": "..."}`. Codes:
-`FILE_NOT_FOUND, NOT_ABSOLUTE_PATH, UNSUPPORTED_FORMAT, LOAD_FAILED, EMPTY_MESH,
-MESH_TOO_LARGE, INVALID_EXPECTATION, INVALID_VIEW, RENDER_FAILED`.
+Only the keys you set are checked. Scalars and vectors accept a bare value (global
+tolerance, default 1 % relative) or an object with `rel_tol`/`abs_tol` overrides; counts
+accept an exact integer or a `min`/`max` range. The pass rule is
+`|actual − expected| ≤ max(abs_tol, rel_tol · |expected|)`.
 
 ## Rendering backends
 
 | Backend | Selection | Notes |
-|---|---|---|
-| **matplotlib** (default) | automatic | Pure CPU, works everywhere. Orthographic, painter's algorithm, Lambert shading, edge overlay — the most informative output for flat-faced CAD parts. |
-| **pyrender + EGL** (opt-in) | `MESH_MCP_RENDERER=pyrender` | GPU offscreen, perspective + true depth; better occlusion on very large organic meshes. Install with `uv sync --extra gl`. Verified working on Linux/EGL (mesa & nvidia). No edge overlay. |
+|---------|-----------|-------|
+| matplotlib (default) | automatic | Pure CPU, works everywhere; orthographic views with edge overlay — well suited to flat-faced CAD parts |
+| pyrender + EGL | `MESH_MCP_RENDERER=pyrender` | GPU offscreen rendering; install with `uv sync --extra gl`. Falls back to matplotlib on any GL failure |
 
-pyrender is a 2021-era package; the `[gl]` extra pins `pyglet<2` and overrides its stale
-`PyOpenGL==3.1.0` pin (see `[tool.uv] override-dependencies`). If EGL picks the wrong GPU,
-set `EGL_DEVICE_ID`. Any GL failure falls back to matplotlib automatically.
+## Configuration
 
-Camera convention: **Z-up**; `front` looks along +Y, `right` looks along −X, `iso` from
-the (+X,−Y,+Z) octant.
-
-## Configuration (env vars)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MESH_MCP_RENDERER` | *(auto → matplotlib)* | `matplotlib` or `pyrender` |
-| `MESH_MCP_MAX_FILE_MB` | 500 | File size cap |
-| `MESH_MCP_MAX_FACES` | 5,000,000 | Face-count cap at load |
-| `MESH_MCP_RENDER_MAX_FACES` | 120,000 | Above this, renders use a seeded face subset (`render_decimated: true`) |
-
-Determinism: every sampling operation uses seed 0; cameras, lights and colors are fixed —
-identical inputs produce identical reports and near-identical images.
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MESH_MCP_RENDERER` | `matplotlib` | Render backend (`matplotlib` or `pyrender`) |
+| `MESH_MCP_MAX_FILE_MB` | `500` | Maximum input file size |
+| `MESH_MCP_MAX_FACES` | `5000000` | Maximum face count at load |
+| `MESH_MCP_RENDER_MAX_FACES` | `120000` | Faces above this are subsampled for display only |
 
 ## Development
 
 ```
 src/mesh_validation_mcp/
-  server.py        # MCP wiring (the only module importing the mcp SDK)
-  loading.py       # file -> LoadedMesh normalization + structured errors
-  metrics.py       # geometric report (pydantic)
-  validation.py    # expectations schema + assertion engine
-  comparison.py    # transform detection, distances, heatmap scalars
-  rendering/       # backends (matplotlib / pyrender), camera math, contact sheets
-tests/             # pytest: unit + in-memory MCP integration tests
+├── server.py        # MCP wiring (the only module importing the mcp SDK)
+├── loading.py       # file loading and normalization
+├── metrics.py       # geometric metric computation
+├── validation.py    # expectations schema and assertion engine
+├── comparison.py    # transform detection, distances, heatmap scalars
+└── rendering/       # camera math, backends, contact-sheet composition
+tests/               # unit tests + in-memory MCP integration tests
 ```
-
-Run a quick manual check without an agent:
 
 ```bash
-uv run python -c "import trimesh; trimesh.creation.box((10,10,5)).export('/tmp/box.stl')"
-uv run mesh-validation-mcp   # then speak MCP over stdio, or just use Claude Code
+uv run pytest
 ```
+
+## License
+
+[MIT](LICENSE)

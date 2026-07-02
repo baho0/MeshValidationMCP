@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mesh-validator": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/baho/Desktop/MeshValidationMCP",
+        "mesh-validation-mcp"
+      ]
+    }
+  }
+}

@@ -8,6 +8,7 @@ import numpy as np
 import trimesh
 from pydantic import BaseModel
 
+from .integrity import IntegrityMetrics, compute_integrity
 from .loading import LoadedMesh
 
 
@@ -44,6 +45,7 @@ class MeshMetrics(BaseModel):
     center_mass: list[float] | None
     bbox_diagonal: float
     units: str | None
+    integrity: IntegrityMetrics
     bodies: list[BodyMetrics]
     caveats: list[str]
 
@@ -88,6 +90,19 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
     if reliable and volume is not None and volume < 0:
         caveats.append("negative_volume: face normals point inward (inverted winding)")
 
+    integrity = compute_integrity(mesh)
+    if integrity.self_intersecting_face_count > 0:
+        caveats.append(
+            f"self_intersecting: {integrity.self_intersecting_face_count} faces intersect; "
+            "volume and watertight status may be misleading"
+        )
+    elif not integrity.self_intersection_checked:
+        caveats.append("self_intersection_not_checked: mesh exceeds the face cap for this test")
+    if integrity.non_manifold_edge_count > 0:
+        caveats.append(
+            f"non_manifold: {integrity.non_manifold_edge_count} edges are shared by 3+ faces"
+        )
+
     extents = np.asarray(mesh.extents, dtype=float)
     return MeshMetrics(
         path=loaded.path,
@@ -109,6 +124,7 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
         center_mass=_vec(mesh.center_mass) if reliable else None,
         bbox_diagonal=float(np.linalg.norm(extents)),
         units=str(mesh.units) if mesh.units else None,
+        integrity=integrity,
         bodies=[_body_metrics(b) for b in loaded.bodies],
         caveats=caveats,
     )

@@ -106,3 +106,79 @@ async def test_compare_meshes_tool(box_path, scaled_path):
         assert report["classification"] == "similarity"
         assert report["transform"]["uniform_scale"] == pytest.approx(2.0, rel=1e-3)
         assert any(b.type == "image" for b in result.content)
+
+
+async def test_inspect_reports_integrity(box_path):
+    async with client_session(server_app._mcp_server) as client:
+        result = await client.call_tool("inspect_mesh", {"file_path": box_path})
+        assert result.structuredContent["integrity"]["self_intersecting_face_count"] == 0
+        assert result.structuredContent["integrity"]["non_manifold_edge_count"] == 0
+
+
+async def test_validate_integrity_fails_and_highlights(self_intersecting_path):
+    async with client_session(server_app._mcp_server) as client:
+        result = await client.call_tool(
+            "validate_mesh",
+            {
+                "file_path": self_intersecting_path,
+                "expectations": {"self_intersecting_face_count": 0},
+            },
+        )
+        assert not result.isError
+        report = json.loads(result.content[0].text)
+        assert report["passed"] is False
+        assert report["render"]["defects_highlighted"] is True
+        assert any(b.type == "image" for b in result.content)
+
+
+async def test_compare_localized_roi(plate_path, emboss_good_path):
+    async with client_session(server_app._mcp_server) as client:
+        result = await client.call_tool(
+            "compare_meshes",
+            {
+                "file_a": plate_path,
+                "file_b": emboss_good_path,
+                "localized": {
+                    "region": {"kind": "box", "min": [-12, -12, 1.5], "max": [12, 12, 8]},
+                    "emboss_height": 3.0,
+                    "max_unchanged_deviation": 0.01,
+                },
+            },
+        )
+        assert not result.isError
+        report = json.loads(result.content[0].text)
+        assert report["localized"]["passed"] is True
+        assert report["localized"]["stats"]["signed_displacement"]["peak"] == pytest.approx(
+            3.0, abs=1e-3
+        )
+
+
+async def test_compare_localized_detects_leak(plate_path, emboss_bad_path):
+    async with client_session(server_app._mcp_server) as client:
+        result = await client.call_tool(
+            "compare_meshes",
+            {
+                "file_a": plate_path,
+                "file_b": emboss_bad_path,
+                "localized": {
+                    "region": {"kind": "box", "min": [-12, -12, 1.5], "max": [12, 12, 8]},
+                    "max_unchanged_deviation": 0.01,
+                },
+            },
+        )
+        report = json.loads(result.content[0].text)
+        assert report["localized"]["passed"] is False
+
+
+async def test_invalid_region_error(box_path):
+    async with client_session(server_app._mcp_server) as client:
+        result = await client.call_tool(
+            "compare_meshes",
+            {
+                "file_a": box_path,
+                "file_b": box_path,
+                "localized": {"region": {"kind": "vertex_ids", "vertex_ids": [999999]}},
+            },
+        )
+        assert result.isError
+        assert "INVALID_REGION" in result.content[0].text

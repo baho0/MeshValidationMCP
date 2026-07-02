@@ -91,6 +91,20 @@ def body_face_colors(mesh: trimesh.Trimesh) -> np.ndarray | None:
     return palette[labels % 10]
 
 
+_HIGHLIGHT_BASE = np.array((174, 184, 196)) / 255.0
+_HIGHLIGHT_ALERT = np.array((220, 38, 38)) / 255.0
+
+
+def highlight_face_colors(mesh: trimesh.Trimesh, face_ids: np.ndarray) -> np.ndarray:
+    """Paint the given faces a solid alert red over a neutral base, so defect
+    locations (broken/sliver/self-intersecting/flipped faces) pop in the render."""
+    colors = np.tile(_HIGHLIGHT_BASE, (len(mesh.faces), 1))
+    ids = np.asarray(face_ids, dtype=np.int64)
+    if ids.size:
+        colors[ids] = _HIGHLIGHT_ALERT
+    return colors
+
+
 def scalars_to_face_colors(
     mesh: trimesh.Trimesh, vertex_scalars: np.ndarray, label: str, cmap: str = "viridis"
 ) -> tuple[np.ndarray, ColorbarSpec]:

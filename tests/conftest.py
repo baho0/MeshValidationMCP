@@ -73,3 +73,81 @@ def scaled_path(tmp_path, box):
 @pytest.fixture
 def subdivided_path(tmp_path, box):
     return _export(box.copy().subdivide(), tmp_path / "subdivided.stl")
+
+
+# --- Localized-change (emboss) fixtures: a subdivided plate, spanning z in [0, 2] ---
+
+
+def _make_plate():
+    plate = trimesh.creation.box(extents=(40.0, 40.0, 2.0))
+    plate.apply_translation((0, 0, 1.0))
+    for _ in range(5):
+        plate = plate.subdivide()
+    return plate
+
+
+def _emboss(plate, top_only, center=(0.0, 0.0), radius=10.0, height=3.0):
+    mesh = plate.copy()
+    v = mesh.vertices.copy()
+    in_xy = np.linalg.norm(v[:, :2] - np.asarray(center), axis=1) < radius
+    if top_only:
+        in_xy &= v[:, 2] > v[:, 2].max() - 1e-6
+    v[in_xy, 2] += height
+    mesh.vertices = v
+    return mesh
+
+
+@pytest.fixture
+def plate_path(tmp_path):
+    return _export(_make_plate(), tmp_path / "plate.stl")
+
+
+@pytest.fixture
+def emboss_good_path(tmp_path):
+    """Correct emboss: only the top surface of the region is raised 3mm."""
+    return _export(_emboss(_make_plate(), top_only=True), tmp_path / "emboss_good.stl")
+
+
+@pytest.fixture
+def emboss_bad_path(tmp_path):
+    """Buggy emboss: the whole XY column (incl. the bottom) is moved 3mm."""
+    return _export(_emboss(_make_plate(), top_only=False), tmp_path / "emboss_bad.stl")
+
+
+# --- Integrity defect fixtures ---
+
+
+@pytest.fixture
+def self_intersecting_path(tmp_path):
+    a = trimesh.creation.box((10, 10, 10))
+    b = trimesh.creation.box((10, 10, 10))
+    b.apply_translation((5, 5, 5))
+    return _export(trimesh.util.concatenate([a, b]), tmp_path / "selfint.stl")
+
+
+@pytest.fixture
+def non_manifold_path(tmp_path):
+    boxes = [
+        trimesh.creation.box((10, 10, 10)),
+        trimesh.creation.box((10, 10, 10)).apply_translation((10, 0, 0)),
+        trimesh.creation.box((10, 10, 10)).apply_translation((0, 0, 10)),
+    ]
+    merged = trimesh.util.concatenate(boxes)
+    merged.merge_vertices()
+    return _export(merged, tmp_path / "nonmanifold.stl")
+
+
+@pytest.fixture
+def duplicated_path(tmp_path, box):
+    return _export(
+        trimesh.util.concatenate([box, box.copy()]), tmp_path / "duplicated.stl"
+    )
+
+
+@pytest.fixture
+def flipped_path(tmp_path):
+    mesh = trimesh.creation.icosphere(subdivisions=2, radius=2.0)
+    faces = mesh.faces.copy()
+    faces[:5] = faces[:5][:, ::-1]
+    mesh.faces = faces
+    return _export(mesh, tmp_path / "flipped.stl")

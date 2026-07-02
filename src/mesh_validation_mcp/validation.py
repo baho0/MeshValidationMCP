@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 from difflib import get_close_matches
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import ErrorCode, MeshToolError
 from .metrics import MeshMetrics
+from .region import Region
+
+if TYPE_CHECKING:
+    from .comparison import LocalizedChange
+
+# Integrity keys map directly onto IntegrityMetrics fields (typically expected 0).
+_INTEGRITY_COUNT_KEYS = (
+    "boundary_edge_count",
+    "non_manifold_edge_count",
+    "degenerate_face_count",
+    "sliver_face_count",
+    "duplicate_face_count",
+    "unmerged_vertex_count",
+    "unreferenced_vertex_count",
+    "flipped_face_count",
+    "self_intersecting_face_count",
+)
 
 # Matched against MeshMetrics fields; order here is the evaluation/report order.
 SUPPORTED_KEYS = (
@@ -24,6 +41,8 @@ SUPPORTED_KEYS = (
     "winding_consistent",
     "body_count",
     "euler_number",
+    *_INTEGRITY_COUNT_KEYS,
+    "min_triangle_quality",
 )
 
 _TINY = 1e-12
@@ -87,6 +106,17 @@ class Expectations(BaseModel):
     winding_consistent: bool | None = None
     body_count: int | None = None
     euler_number: int | None = None
+    # Integrity checks (usually expected 0); see IntegrityMetrics for meaning.
+    boundary_edge_count: int | CountCheck | None = None
+    non_manifold_edge_count: int | CountCheck | None = None
+    degenerate_face_count: int | CountCheck | None = None
+    sliver_face_count: int | CountCheck | None = None
+    duplicate_face_count: int | CountCheck | None = None
+    unmerged_vertex_count: int | CountCheck | None = None
+    unreferenced_vertex_count: int | CountCheck | None = None
+    flipped_face_count: int | CountCheck | None = None
+    self_intersecting_face_count: int | CountCheck | None = None
+    min_triangle_quality: float | ScalarCheck | None = None  # lower bound (actual >= expected)
 
 
 class CheckResult(BaseModel):
@@ -214,6 +244,40 @@ def _count_check(name: str, spec: int | CountCheck, actual: int) -> CheckResult:
     )
 
 
+def _upper_bound_check(
+    name: str, spec: float | ScalarCheck, actual: float, global_tol: Tolerance
+) -> CheckResult:
+    """Pass when actual <= expected (a limit), allowing the usual tolerance slack above."""
+    check = spec if isinstance(spec, ScalarCheck) else ScalarCheck(expected=float(spec))
+    rel, abs_ = _resolve_tols(check.rel_tol, check.abs_tol, global_tol)
+    limit = check.expected + _allowed(check.expected, rel, abs_)
+    return CheckResult(
+        name=name,
+        passed=actual <= limit,
+        expected=check.expected,
+        actual=actual,
+        deviation=actual - check.expected,
+        tolerance={"relative": rel, "absolute": abs_},
+    )
+
+
+def _lower_bound_check(
+    name: str, spec: float | ScalarCheck, actual: float, global_tol: Tolerance
+) -> CheckResult:
+    """Pass when actual >= expected (a floor), allowing the usual tolerance slack below."""
+    check = spec if isinstance(spec, ScalarCheck) else ScalarCheck(expected=float(spec))
+    rel, abs_ = _resolve_tols(check.rel_tol, check.abs_tol, global_tol)
+    floor = check.expected - _allowed(check.expected, rel, abs_)
+    return CheckResult(
+        name=name,
+        passed=actual >= floor,
+        expected=check.expected,
+        actual=actual,
+        deviation=actual - check.expected,
+        tolerance={"relative": rel, "absolute": abs_},
+    )
+
+
 def _exact_check(name: str, expected: Any, actual: Any) -> CheckResult:
     return CheckResult(name=name, passed=actual == expected, expected=expected, actual=actual)
 
@@ -274,6 +338,25 @@ def evaluate(metrics: MeshMetrics, expectations: Expectations) -> ValidationRepo
             _exact_check("euler_number", expectations.euler_number, metrics.euler_number)
         )
 
+    for key in _INTEGRITY_COUNT_KEYS:
+        spec = getattr(expectations, key)
+        if spec is None:
+            continue
+        check = _count_check(key, spec, getattr(metrics.integrity, key))
+        if key == "self_intersecting_face_count" and not metrics.integrity.self_intersection_checked:
+            check.passed = False
+            check.caveats.append("self-intersection was not verified: mesh exceeds the face cap")
+        checks.append(check)
+    if expectations.min_triangle_quality is not None:
+        checks.append(
+            _lower_bound_check(
+                "min_triangle_quality",
+                expectations.min_triangle_quality,
+                metrics.integrity.min_triangle_quality,
+                tol,
+            )
+        )
+
     if not checks:
         raise MeshToolError(
             ErrorCode.INVALID_EXPECTATION,
@@ -290,4 +373,76 @@ def evaluate(metrics: MeshMetrics, expectations: Expectations) -> ValidationRepo
             details.append(f"... and {len(failed) - 5} more failures")
         summary += " " + ". ".join(details) + "."
 
+    return ValidationReport(passed=not failed, summary=summary, checks=checks)
+
+
+class ChangeExpectations(BaseModel):
+    """Assertions about a LOCALIZED change between a before- and after-mesh, scoped to a
+    region. `region` is required; every assertion field is optional (provide the region
+    alone to just report the localized stats). All values are in the file's native units."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    region: Region
+    change_threshold: float | None = Field(
+        default=None,
+        description="Displacement above which a vertex counts as 'changed' (default: "
+        "a small fraction of the before-mesh bbox diagonal).",
+    )
+    max_unchanged_deviation: float | ScalarCheck | None = Field(
+        default=None,
+        description="Upper bound on how far any vertex OUTSIDE the region may move "
+        "(assert the rest of the mesh is untouched).",
+    )
+    emboss_height: float | ScalarCheck | None = Field(
+        default=None, description="Expected outward height of the change (material added)."
+    )
+    pocket_depth: float | ScalarCheck | None = Field(
+        default=None, description="Expected inward depth of the change (material removed)."
+    )
+    tolerance: Tolerance = Field(default_factory=Tolerance)
+
+
+_SIDEWALL_CAVEAT = (
+    "signed height/depth is the 95th-percentile-magnitude of the changed vertices' motion "
+    "along the before-surface normal; tessellated side walls can bias it"
+)
+
+
+def evaluate_change(change: LocalizedChange, exp: ChangeExpectations) -> ValidationReport:
+    tol = exp.tolerance
+    approx = [] if change.same_topology else ["measured on differing topology; approximate"]
+    checks: list[CheckResult] = []
+
+    if exp.max_unchanged_deviation is not None:
+        check = _upper_bound_check(
+            "untouched_region_max_deviation",
+            exp.max_unchanged_deviation,
+            change.outside_max_displacement,
+            tol,
+        )
+        check.caveats.extend(approx)
+        checks.append(check)
+    if exp.emboss_height is not None:
+        check = _scalar_check(
+            "emboss_height", exp.emboss_height, change.signed_displacement.peak, tol
+        )
+        check.caveats.append(_SIDEWALL_CAVEAT)
+        check.caveats.extend(approx)
+        checks.append(check)
+    if exp.pocket_depth is not None:
+        check = _scalar_check(
+            "pocket_depth", exp.pocket_depth, -change.signed_displacement.peak, tol
+        )
+        check.caveats.append(_SIDEWALL_CAVEAT)
+        check.caveats.extend(approx)
+        checks.append(check)
+
+    failed = [c for c in checks if not c.passed]
+    if not checks:
+        summary = "no localized-change assertions; reporting stats only."
+    else:
+        summary = f"{len(checks) - len(failed)}/{len(checks)} localized checks passed."
+        if failed:
+            summary += " " + ". ".join(_fail_detail(c) for c in failed) + "."
     return ValidationReport(passed=not failed, summary=summary, checks=checks)

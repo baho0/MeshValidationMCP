@@ -11,9 +11,15 @@ from pydantic import BaseModel
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
-from .config import HEATMAP_MAX_VERTICES, MAX_COMPARE_SAMPLES, SEED
+from .config import (
+    HEATMAP_MAX_VERTICES,
+    LOCALIZED_CHANGE_REL,
+    MAX_COMPARE_SAMPLES,
+    SEED,
+)
 from .loading import LoadedMesh
-from .metrics import compute_metrics
+from .metrics import Bounds, compute_metrics
+from .region import RegionBase
 
 Classification = Literal[
     "identical", "translation", "rotation", "rigid", "similarity", "mirrored", "deformed"
@@ -55,6 +61,31 @@ class ComparisonReport(BaseModel):
     metric_deltas: dict[str, Any]
     caveats: list[str]
     summary: str
+
+
+class SignedDisplacement(BaseModel):
+    """Signed motion of the changed vertices along the before-surface normal.
+    Positive = material added outward (emboss/boss); negative = removed (pocket)."""
+
+    peak: float  # signed value at the 95th-percentile magnitude (robust height/depth)
+    mean: float
+    max_outward: float
+    max_inward: float
+    outward_fraction: float
+
+
+class LocalizedChange(BaseModel):
+    reference_mesh: Literal["A", "B"]  # which mesh the region was evaluated on
+    same_topology: bool
+    change_threshold: float
+    region_vertex_count: int
+    changed_vertex_count: int
+    inside_max_displacement: float
+    outside_max_displacement: float  # the "is the rest untouched?" number
+    changed_region_bounds: Bounds | None
+    changed_region_centroid: list[float] | None
+    signed_displacement: SignedDisplacement
+    caveats: list[str]
 
 
 def _apply(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -186,6 +217,96 @@ def _summary(
         f"B is NOT a rigid/similarity transform of A: best-fit residual RMS {residual:.3g} "
         f"(~{residual / diagonal:.2%} of A's bbox diagonal). "
         "Inspect the distances and the displacement heatmap."
+    )
+
+
+def _signed_displacement(outward: np.ndarray) -> SignedDisplacement:
+    if outward.size == 0:
+        return SignedDisplacement(
+            peak=0.0, mean=0.0, max_outward=0.0, max_inward=0.0, outward_fraction=0.0
+        )
+    order = np.argsort(np.abs(outward))
+    peak = float(outward[order[int(round(0.95 * (len(outward) - 1)))]])
+    return SignedDisplacement(
+        peak=peak,
+        mean=float(outward.mean()),
+        max_outward=float(max(outward.max(), 0.0)),
+        max_inward=float(min(outward.min(), 0.0)),
+        outward_fraction=float((outward > 0).mean()),
+    )
+
+
+def localized_change(
+    loaded_a: LoadedMesh,
+    loaded_b: LoadedMesh,
+    region: RegionBase,
+    change_threshold: float | None = None,
+) -> LocalizedChange:
+    """Restrict the before/after comparison to a region: how much moved inside it,
+    whether everything outside stayed put, and the signed height/depth of the change."""
+    a, b = loaded_a.combined, loaded_b.combined
+    caveats: list[str] = []
+    diagonal = float(np.linalg.norm(a.extents)) or 1.0
+    threshold = (
+        change_threshold if change_threshold is not None else LOCALIZED_CHANGE_REL * diagonal
+    )
+
+    same_topology = len(a.vertices) == len(b.vertices) and np.array_equal(a.faces, b.faces)
+    if same_topology:
+        reference: trimesh.Trimesh = a
+        reference_mesh = "A"
+        delta = np.asarray(b.vertices) - np.asarray(a.vertices)
+        displacement = np.linalg.norm(delta, axis=1)
+        outward_all = np.einsum("ij,ij->i", delta, np.asarray(a.vertex_normals))
+    else:
+        # No vertex correspondence: evaluate the region on the after-mesh and measure
+        # each B vertex's distance to A's surface (0 => that point is unchanged).
+        reference = b
+        reference_mesh = "B"
+        bverts = np.asarray(b.vertices)
+        displacement = trimesh.proximity.closest_point(a, bverts)[1]
+        if a.is_watertight:
+            # signed_distance is +inside A; outward (material added) is the negative.
+            outward_all = -np.asarray(trimesh.proximity.signed_distance(a, bverts))
+        else:
+            outward_all = displacement.copy()  # sign unknown
+            caveats.append(
+                "before-mesh is not watertight: signed emboss/pocket direction is "
+                "unavailable, reporting unsigned displacement magnitudes"
+            )
+        caveats.append(
+            "topology differs between A and B: region evaluated on the after-mesh (B) and "
+            "displacement measured to A's surface; values are approximate"
+        )
+
+    vmask = region.vertex_mask(reference)
+    inside = displacement[vmask]
+    outside = displacement[~vmask]
+    changed = displacement > threshold
+    feature_mask = vmask & changed
+    changed_pts = np.asarray(reference.vertices)[changed]
+
+    if changed_pts.size:
+        bounds = Bounds(
+            min=[float(x) for x in changed_pts.min(axis=0)],
+            max=[float(x) for x in changed_pts.max(axis=0)],
+        )
+        centroid = [float(x) for x in changed_pts.mean(axis=0)]
+    else:
+        bounds, centroid = None, None
+
+    return LocalizedChange(
+        reference_mesh=reference_mesh,
+        same_topology=same_topology,
+        change_threshold=threshold,
+        region_vertex_count=int(vmask.sum()),
+        changed_vertex_count=int(changed.sum()),
+        inside_max_displacement=float(inside.max()) if inside.size else 0.0,
+        outside_max_displacement=float(outside.max()) if outside.size else 0.0,
+        changed_region_bounds=bounds,
+        changed_region_centroid=centroid,
+        signed_displacement=_signed_displacement(outward_all[feature_mask]),
+        caveats=caveats,
     )
 
 

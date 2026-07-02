@@ -115,22 +115,30 @@ def _plane_interval(proj: np.ndarray, dist: np.ndarray) -> tuple[float, float] |
 
 
 def _tri_tri_intersect(t1: np.ndarray, t2: np.ndarray, eps: float) -> bool:
-    """Moller (1997) interval-overlap test. Coplanar pairs return False (approximate)."""
+    """Moller (1997) interval-overlap test. Coplanar pairs return False (approximate).
+
+    Normals are unit-normalized so `du`/`dv` are true point-to-plane distances (length
+    units, comparable to `eps`) and the parallel-plane test uses sin(theta) (dimensionless
+    against a fixed tolerance) — otherwise the thresholds would be scale-dependent."""
     n1 = np.cross(t1[1] - t1[0], t1[2] - t1[0])
-    d1 = -n1.dot(t1[0])
-    du = t2 @ n1 + d1
+    n2 = np.cross(t2[1] - t2[0], t2[2] - t2[0])
+    len1 = np.linalg.norm(n1)
+    len2 = np.linalg.norm(n2)
+    if len1 == 0.0 or len2 == 0.0:
+        return False  # a degenerate triangle has no well-defined plane
+    n1 /= len1
+    n2 /= len2
+
+    du = t2 @ n1 - n1.dot(t1[0])
     if np.all(du > eps) or np.all(du < -eps):
         return False
-
-    n2 = np.cross(t2[1] - t2[0], t2[2] - t2[0])
-    d2 = -n2.dot(t2[0])
-    dv = t1 @ n2 + d2
+    dv = t1 @ n2 - n2.dot(t2[0])
     if np.all(dv > eps) or np.all(dv < -eps):
         return False
 
-    direction = np.cross(n1, n2)
-    if np.linalg.norm(direction) < eps:
-        return False  # coplanar: not handled
+    direction = np.cross(n1, n2)  # magnitude == sin(angle between planes)
+    if np.linalg.norm(direction) < 1e-8:
+        return False  # coplanar/parallel: not handled
 
     axis = int(np.argmax(np.abs(direction)))
     i1 = _plane_interval(t1[:, axis], dv)

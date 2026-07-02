@@ -423,16 +423,15 @@ def evaluate_change(change: LocalizedChange, exp: ChangeExpectations) -> Validat
         )
         check.caveats.extend(approx)
         checks.append(check)
+    peak = change.signed_displacement.peak
     if exp.emboss_height is not None:
-        check = _scalar_check(
-            "emboss_height", exp.emboss_height, change.signed_displacement.peak, tol
-        )
+        check = _scalar_check("emboss_height", exp.emboss_height, peak, tol)
         check.caveats.append(_SIDEWALL_CAVEAT)
         check.caveats.extend(approx)
         checks.append(check)
     if exp.pocket_depth is not None:
         check = _scalar_check(
-            "pocket_depth", exp.pocket_depth, -change.signed_displacement.peak, tol
+            "pocket_depth", exp.pocket_depth, (-peak if peak is not None else None), tol
         )
         check.caveats.append(_SIDEWALL_CAVEAT)
         check.caveats.extend(approx)

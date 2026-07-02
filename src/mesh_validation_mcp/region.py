@@ -2,12 +2,14 @@
 
 A Region is how an agent expresses "the area I manipulated" (the selected region
 of an emboss/pocket/fillet). Every variant exposes ``vertex_mask(mesh)`` returning
-a boolean array over the mesh vertices; ``face_mask`` derives from it.
+a boolean array over the mesh vertices; ``face_mask`` derives from it. Spatial
+variants (box/sphere/plane) also expose ``point_mask(points)`` so membership can be
+tested on arbitrary points (used for footprint membership when topology differs).
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Annotated, ClassVar, Literal, Union
 
 import numpy as np
 import trimesh
@@ -19,6 +21,13 @@ from .errors import ErrorCode, MeshToolError
 class RegionBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Spatial regions test a geometric predicate on coordinates and can be evaluated on
+    # arbitrary points; index-based regions (vertex_ids/face_ids) cannot.
+    spatial: ClassVar[bool] = False
+
+    def point_mask(self, points: np.ndarray) -> np.ndarray:  # pragma: no cover
+        raise NotImplementedError("this region type cannot be evaluated on arbitrary points")
+
     def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:  # pragma: no cover
         raise NotImplementedError
 
@@ -29,13 +38,14 @@ class RegionBase(BaseModel):
 
 
 class BoxRegion(RegionBase):
-    """Axis-aligned bounding box; a vertex is inside when min <= v <= max componentwise."""
+    """Axis-aligned bounding box; a point is inside when min <= p <= max componentwise."""
 
+    spatial: ClassVar[bool] = True
     kind: Literal["box"] = "box"
     min: list[float] = Field(min_length=3, max_length=3)
     max: list[float] = Field(min_length=3, max_length=3)
 
-    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
+    def point_mask(self, points: np.ndarray) -> np.ndarray:
         lo = np.asarray(self.min, dtype=float)
         hi = np.asarray(self.max, dtype=float)
         if np.any(hi < lo):
@@ -44,32 +54,40 @@ class BoxRegion(RegionBase):
                 f"box region has max < min on some axis (min={self.min}, max={self.max})",
                 "Ensure every component of max is >= the matching component of min.",
             )
-        v = np.asarray(mesh.vertices, dtype=float)
-        return np.all((v >= lo) & (v <= hi), axis=1)
+        p = np.asarray(points, dtype=float)
+        return np.all((p >= lo) & (p <= hi), axis=1)
+
+    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
+        return self.point_mask(mesh.vertices)
 
 
 class SphereRegion(RegionBase):
     """Ball of the given radius around center."""
 
+    spatial: ClassVar[bool] = True
     kind: Literal["sphere"] = "sphere"
     center: list[float] = Field(min_length=3, max_length=3)
     radius: float = Field(gt=0)
 
-    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
-        v = np.asarray(mesh.vertices, dtype=float)
+    def point_mask(self, points: np.ndarray) -> np.ndarray:
+        p = np.asarray(points, dtype=float)
         c = np.asarray(self.center, dtype=float)
-        return np.linalg.norm(v - c, axis=1) <= self.radius
+        return np.linalg.norm(p - c, axis=1) <= self.radius
+
+    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
+        return self.point_mask(mesh.vertices)
 
 
 class PlaneRegion(RegionBase):
-    """Half-space on the +normal side of the plane through origin (v inside when
-    (v - origin) . normal >= 0)."""
+    """Half-space on the +normal side of the plane through origin (p inside when
+    (p - origin) . normal >= 0)."""
 
+    spatial: ClassVar[bool] = True
     kind: Literal["plane"] = "plane"
     origin: list[float] = Field(min_length=3, max_length=3)
     normal: list[float] = Field(min_length=3, max_length=3)
 
-    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
+    def point_mask(self, points: np.ndarray) -> np.ndarray:
         n = np.asarray(self.normal, dtype=float)
         norm = np.linalg.norm(n)
         if norm == 0:
@@ -78,9 +96,12 @@ class PlaneRegion(RegionBase):
                 "plane region normal is the zero vector",
                 "Provide a nonzero normal vector.",
             )
-        v = np.asarray(mesh.vertices, dtype=float)
+        p = np.asarray(points, dtype=float)
         o = np.asarray(self.origin, dtype=float)
-        return (v - o) @ (n / norm) >= 0.0
+        return (p - o) @ (n / norm) >= 0.0
+
+    def vertex_mask(self, mesh: trimesh.Trimesh) -> np.ndarray:
+        return self.point_mask(mesh.vertices)
 
 
 class VertexIdsRegion(RegionBase):

@@ -49,6 +49,22 @@ def test_self_intersection(self_intersecting_path):
     assert len(flags["self_intersection"]) == 12
 
 
+@pytest.mark.parametrize("scale", [0.001, 1.0, 1000.0])
+def test_self_intersection_is_scale_invariant(scale):
+    # Regression: the Moller test must not depend on absolute mesh scale (the coplanar
+    # threshold once compared a length^1 eps against a length^4 cross product).
+    import trimesh
+
+    from mesh_validation_mcp.integrity import _self_intersecting_faces
+
+    a = trimesh.creation.box((10, 10, 10))
+    b = trimesh.creation.box((10, 10, 10))
+    b.apply_translation((5, 5, 5))
+    mesh = trimesh.util.concatenate([a, b]).subdivide()  # small triangles
+    mesh.apply_scale(scale)
+    assert len(_self_intersecting_faces(mesh)) > 0
+
+
 def test_duplicate_faces(duplicated_path):
     # STL merges coincident vertices on load, so the doubled surface shows up as
     # duplicate faces (and, once merged, non-manifold edges) rather than unmerged vertices.

@@ -65,9 +65,11 @@ class ComparisonReport(BaseModel):
 
 class SignedDisplacement(BaseModel):
     """Signed motion of the changed vertices along the before-surface normal.
-    Positive = material added outward (emboss/boss); negative = removed (pocket)."""
+    Positive = material added outward (emboss/boss); negative = removed (pocket).
+    `peak` is None when the signed depth could not be determined (differing topology
+    where the changed vertices did not map into the region)."""
 
-    peak: float  # signed value at the 95th-percentile magnitude (robust height/depth)
+    peak: float | None  # signed value at the 95th-percentile magnitude (robust height/depth)
     mean: float
     max_outward: float
     max_inward: float
@@ -258,13 +260,16 @@ def localized_change(
         delta = np.asarray(b.vertices) - np.asarray(a.vertices)
         displacement = np.linalg.norm(delta, axis=1)
         outward_all = np.einsum("ij,ij->i", delta, np.asarray(a.vertex_normals))
+        vmask = region.vertex_mask(reference)
     else:
-        # No vertex correspondence: evaluate the region on the after-mesh and measure
-        # each B vertex's distance to A's surface (0 => that point is unchanged).
+        # No vertex correspondence: measure each B vertex's distance to A's surface
+        # (0 => that point is unchanged). Region membership is decided by the vertex's
+        # FOOTPRINT — its closest point on A — so a vertex that moved out of a surface-
+        # aligned region (e.g. a pocket floor) still belongs to that region.
         reference = b
         reference_mesh = "B"
         bverts = np.asarray(b.vertices)
-        displacement = trimesh.proximity.closest_point(a, bverts)[1]
+        closest, displacement, _tri = trimesh.proximity.closest_point(a, bverts)
         if a.is_watertight:
             # signed_distance is +inside A; outward (material added) is the negative.
             outward_all = -np.asarray(trimesh.proximity.signed_distance(a, bverts))
@@ -274,17 +279,26 @@ def localized_change(
                 "before-mesh is not watertight: signed emboss/pocket direction is "
                 "unavailable, reporting unsigned displacement magnitudes"
             )
+        if region.spatial:
+            vmask = region.point_mask(closest)
+        else:
+            vmask = region.vertex_mask(reference)
+            caveats.append(
+                "region is index-based but topology differs: membership uses the after-mesh "
+                "vertex indices, which do not correspond to the before-mesh; results are approximate"
+            )
         caveats.append(
-            "topology differs between A and B: region evaluated on the after-mesh (B) and "
-            "displacement measured to A's surface; values are approximate"
+            "topology differs between A and B: displacement measured to A's surface and "
+            "region membership by footprint; values are approximate"
         )
 
-    vmask = region.vertex_mask(reference)
-    inside = displacement[vmask]
-    outside = displacement[~vmask]
     changed = displacement > threshold
     feature_mask = vmask & changed
-    changed_pts = np.asarray(reference.vertices)[changed]
+    inside = displacement[vmask]
+    outside = displacement[~vmask]
+    # 'changed_region_*' describes the change INSIDE the region (feature_mask), staying
+    # consistent with signed_displacement, which is also computed over feature_mask.
+    changed_pts = np.asarray(reference.vertices)[feature_mask]
 
     if changed_pts.size:
         bounds = Bounds(
@@ -295,17 +309,29 @@ def localized_change(
     else:
         bounds, centroid = None, None
 
+    signed = _signed_displacement(outward_all[feature_mask])
+    if not same_topology and feature_mask.sum() == 0 and int(changed.sum()) > 0:
+        # A change exists but none of it mapped into the region on differing topology
+        # (e.g. a deep pocket whose floor is nearer A's opposite face). Report the signed
+        # depth as indeterminate rather than a misleading 0.0.
+        signed.peak = None
+        caveats.append(
+            "a change was detected but did not map into the region on differing topology; "
+            "the signed height/depth is indeterminate — re-run with matching topology "
+            "(edit vertices in place) to measure it"
+        )
+
     return LocalizedChange(
         reference_mesh=reference_mesh,
         same_topology=same_topology,
         change_threshold=threshold,
         region_vertex_count=int(vmask.sum()),
-        changed_vertex_count=int(changed.sum()),
+        changed_vertex_count=int(feature_mask.sum()),  # changed AND inside the region
         inside_max_displacement=float(inside.max()) if inside.size else 0.0,
         outside_max_displacement=float(outside.max()) if outside.size else 0.0,
         changed_region_bounds=bounds,
         changed_region_centroid=centroid,
-        signed_displacement=_signed_displacement(outward_all[feature_mask]),
+        signed_displacement=signed,
         caveats=caveats,
     )
 

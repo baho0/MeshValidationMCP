@@ -108,6 +108,50 @@ def test_deformed(box_path, sphere_path):
     assert len(heatmap) == 642
 
 
+def _same_topology(mesh, linear, path):
+    m = mesh.copy()
+    m.vertices = mesh.vertices @ np.asarray(linear, dtype=float).T
+    m.faces = mesh.faces.copy()
+    m.export(path)
+    return str(path)
+
+
+def test_anisotropic_scale_is_affine(tmp_path, box):
+    a_path = str(tmp_path / "a.ply")
+    box.export(a_path)
+    b_path = _same_topology(box, np.diag([2.0, 1.0, 1.0]), tmp_path / "aniso.ply")
+    report, _ = _compare(a_path, b_path)
+    assert report.classification == "affine"
+    assert report.transform.affine is not None
+    assert report.transform.affine.anisotropic
+    assert not report.transform.affine.has_shear
+    assert sorted(report.transform.affine.singular_values, reverse=True)[0] == pytest.approx(2.0, rel=1e-3)
+
+
+def test_shear_is_affine_with_shear_flag(tmp_path, box):
+    a_path = str(tmp_path / "a.ply")
+    box.export(a_path)
+    b_path = _same_topology(box, [[1, 0.4, 0], [0, 1, 0], [0, 0, 1]], tmp_path / "shear.ply")
+    report, _ = _compare(a_path, b_path)
+    assert report.classification == "affine"
+    assert report.transform.affine.has_shear
+    assert report.transform.affine.determinant == pytest.approx(1.0, rel=1e-3)  # shear conserves volume
+
+
+def test_rigid_transform_reports_invariants(box_path, rotated_path):
+    report, _ = _compare(box_path, rotated_path)
+    names = {c.name for c in report.transform_invariants}
+    assert "volume_preserved" in names and "area_preserved" in names
+    assert all(c.passed for c in report.transform_invariants)
+
+
+def test_similarity_reports_scaling_invariants(box_path, scaled_path):
+    report, _ = _compare(box_path, scaled_path)
+    names = {c.name for c in report.transform_invariants}
+    assert "volume_scales_cubically" in names
+    assert all(c.passed for c in report.transform_invariants)
+
+
 def test_metric_deltas_and_seed(box_path, translated_path):
     report, _ = _compare(box_path, translated_path, sample_count=500)
     # Sampling is adaptive: the requested count is a floor, not an exact target.

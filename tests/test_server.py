@@ -14,7 +14,14 @@ async def test_list_tools():
     async with client_session(server_app._mcp_server) as client:
         result = await client.list_tools()
         names = {tool.name for tool in result.tools}
-        assert names == {"inspect_mesh", "validate_mesh", "render_mesh", "compare_meshes"}
+        assert names == {
+            "inspect_mesh",
+            "validate_mesh",
+            "render_mesh",
+            "compare_meshes",
+            "assert_properties",
+            "compare_to_golden",
+        }
         validate = next(t for t in result.tools if t.name == "validate_mesh")
         schema = json.dumps(validate.inputSchema)
         assert "volume" in schema and "bbox_extents" in schema and "watertight" in schema

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
-from .confidence import Confidence, sampled, sampling_error
+from .confidence import Confidence, exact, sampled, sampling_error
 from .config import (
     HEATMAP_MAX_VERTICES,
     LOCALIZED_CHANGE_REL,
@@ -19,11 +19,19 @@ from .config import (
     SEED,
 )
 from .loading import LoadedMesh
-from .metrics import Bounds, compute_metrics
+from .metrics import Bounds, MeshMetrics, compute_metrics
 from .region import RegionBase
+from .validation import CheckResult
 
 Classification = Literal[
-    "identical", "translation", "rotation", "rigid", "similarity", "mirrored", "deformed"
+    "identical",
+    "translation",
+    "rotation",
+    "rigid",
+    "similarity",
+    "affine",
+    "mirrored",
+    "deformed",
 ]
 
 # Thresholds are relative to A's bbox diagonal. The exact-correspondence path
@@ -36,6 +44,20 @@ _THRESHOLDS = {
 }
 
 
+class AffineDecomposition(BaseModel):
+    """A full 12-dof affine map (same-topology path) decomposed via SVD: b ≈ a·L^T + t.
+    `singular_values` are the per-axis stretch factors, `determinant` the volume scale.
+    `has_shear` is true when the linear part is non-normal (a genuine shear, not just a
+    scale along rotated axes)."""
+
+    singular_values: list[float]
+    determinant: float
+    rotation_angle_deg: float
+    anisotropic: bool
+    has_shear: bool
+    residual_rms: float
+
+
 class TransformInfo(BaseModel):
     matrix_4x4: list[list[float]]
     translation: list[float]
@@ -44,6 +66,7 @@ class TransformInfo(BaseModel):
     uniform_scale: float
     residual_rms: float
     includes_reflection: bool = False
+    affine: AffineDecomposition | None = None
 
 
 class DistanceInfo(BaseModel):
@@ -67,6 +90,9 @@ class ComparisonReport(BaseModel):
     transform: TransformInfo
     distances: DistanceInfo
     metric_deltas: dict[str, Any]
+    # Invariants the classification IMPLIES, asserted against the measured metrics: a rigid
+    # motion must conserve volume & area, a similarity must scale them by s^3 / s^2, etc.
+    transform_invariants: list[CheckResult]
     caveats: list[str]
     summary: str
 
@@ -160,6 +186,93 @@ def _decompose(matrix: np.ndarray) -> tuple[float, np.ndarray, float, list[float
     return scale, matrix[:3, 3].copy(), angle_deg, axis
 
 
+def _affine_decompose(
+    a_verts: np.ndarray, b_verts: np.ndarray
+) -> tuple[AffineDecomposition, float]:
+    """Least-squares 12-dof affine fit b ≈ a·L^T + t, decomposed by SVD. Returns the
+    decomposition and its RMS residual (same units as the vertices)."""
+    homog = np.hstack([a_verts, np.ones((len(a_verts), 1))])
+    solution, *_ = np.linalg.lstsq(homog, b_verts, rcond=None)  # (4, 3)
+    linear = solution[:3, :].T  # 3x3: rows map a-axes to b
+    residual = float(np.sqrt(np.mean(np.sum((homog @ solution - b_verts) ** 2, axis=1))))
+
+    u, sv, vt = np.linalg.svd(linear)
+    rot = u @ vt
+    if np.linalg.det(rot) < 0:
+        vt = vt.copy()
+        vt[-1] *= -1
+        rot = u @ vt
+    angle_deg = math.degrees(float(np.linalg.norm(Rotation.from_matrix(rot).as_rotvec())))
+    smax, smin = float(sv.max()), float(max(sv.min(), 1e-12))
+    anisotropic = (smax / smin) > 1.001
+    # A non-normal linear part (L^T L != L L^T) is a genuine shear, distinct from a pure
+    # scale along rotated axes (which is symmetric, hence normal).
+    normal_gap = float(np.linalg.norm(linear.T @ linear - linear @ linear.T))
+    has_shear = normal_gap > 1e-4 * smax**2
+    return (
+        AffineDecomposition(
+            singular_values=[float(s) for s in sorted(sv, reverse=True)],
+            determinant=float(np.linalg.det(linear)),
+            rotation_angle_deg=angle_deg,
+            anisotropic=anisotropic,
+            has_shear=has_shear,
+            residual_rms=residual,
+        ),
+        residual,
+    )
+
+
+def _invariant_checks(
+    classification: Classification,
+    method: str,
+    scale: float,
+    metrics_a: MeshMetrics,
+    metrics_b: MeshMetrics,
+) -> list[CheckResult]:
+    """Assert the metric invariants a classification implies (volume/area conservation or
+    scaling). A violated invariant means the tidy classification is suspect."""
+    exact_method = method == "procrustes_exact"
+    rel = 5e-3 if exact_method else 3e-2
+    basis = "exact vertex correspondence" if exact_method else "ICP estimate"
+    va, vb = metrics_a.volume, metrics_b.volume
+    aa, ab = metrics_a.surface_area, metrics_b.surface_area
+
+    def _check(name: str, expected: float | None, actual: float | None) -> CheckResult | None:
+        if expected is None or actual is None:
+            return None
+        limit = max(rel * abs(expected), 1e-9)
+        return CheckResult(
+            name=name,
+            passed=abs(actual - expected) <= limit,
+            expected=expected,
+            actual=actual,
+            deviation=actual - expected,
+            deviation_pct=((actual - expected) / expected * 100.0) if expected else None,
+            tolerance={"relative": rel, "absolute": None},
+            confidence=exact(f"{basis}: implied {name}"),
+        )
+
+    checks: list[CheckResult | None] = []
+    if classification in ("identical", "translation", "rotation", "rigid"):
+        vol_reliable = metrics_a.volume_reliable and metrics_b.volume_reliable
+        checks.append(_check("volume_preserved", va if vol_reliable else None, vb))
+        checks.append(_check("area_preserved", aa, ab))
+    elif classification == "similarity":
+        vol_reliable = metrics_a.volume_reliable and metrics_b.volume_reliable
+        checks.append(
+            _check("volume_scales_cubically", (va * scale**3) if vol_reliable else None, vb)
+        )
+        checks.append(_check("area_scales_quadratically", aa * scale**2, ab))
+    elif classification == "mirrored":
+        vol_reliable = metrics_a.volume_reliable and metrics_b.volume_reliable
+        checks.append(
+            _check("volume_magnitude_preserved", abs(va) if (vol_reliable and va is not None) else None,
+                   abs(vb) if vb is not None else None)
+        )
+        checks.append(_check("area_preserved", aa, ab))
+    return [c for c in checks if c is not None]
+
+
 def _classify(
     residual: float,
     scale: float,
@@ -223,6 +336,11 @@ def _summary(
         if float(np.linalg.norm(translation)) > limits["translation"] * diagonal:
             parts.append(f"translated by {_fmt_vec(translation)}")
         return f"B is A {', '.join(parts)} ({basis}, residual RMS {residual:.3g})."
+    if classification == "affine":
+        return (
+            f"B is an AFFINE transform of A (anisotropic scale and/or shear; {basis}, "
+            f"residual RMS {residual:.3g}). See transform.affine for the SVD decomposition."
+        )
     return (
         f"B is NOT a rigid/similarity transform of A: best-fit residual RMS {residual:.3g} "
         f"(~{residual / diagonal:.2%} of A's bbox diagonal). "
@@ -477,6 +595,17 @@ def compare(
     if includes_reflection and residual <= _THRESHOLDS[method]["residual"] * diagonal:
         classification = "mirrored"
 
+    # A poor rigid/similarity fit on matching topology may still be a clean AFFINE map
+    # (anisotropic scale or shear), which the uniform-scale procrustes cannot represent.
+    affine_decomp: AffineDecomposition | None = None
+    if method == "procrustes_exact" and classification == "deformed":
+        decomp, affine_residual = _affine_decompose(
+            np.asarray(a.vertices, dtype=float), np.asarray(b.vertices, dtype=float)
+        )
+        if affine_residual <= _THRESHOLDS["procrustes_exact"]["residual"] * diagonal:
+            classification = "affine"
+            affine_decomp = decomp
+
     dist = _bounded_distances(a, b, sample_count, diagonal)
     points_a = dist["points_a"]
     samples = dist["sample_count"]
@@ -486,6 +615,15 @@ def compare(
     metrics_b = compute_metrics(loaded_b)
     for prefix, metrics in (("A", metrics_a), ("B", metrics_b)):
         caveats.extend(f"{prefix}: {c}" for c in metrics.caveats)
+
+    invariants = _invariant_checks(classification, method, scale, metrics_a, metrics_b)
+    for chk in invariants:
+        if not chk.passed:
+            pct = f" ({chk.deviation_pct:+.2f}%)" if chk.deviation_pct is not None else ""
+            caveats.append(
+                f"invariant '{chk.name}' implied by classification '{classification}' does "
+                f"not hold{pct}: the transform may actually be a deformation"
+            )
 
     report = ComparisonReport(
         classification=classification,
@@ -498,6 +636,7 @@ def compare(
             uniform_scale=scale,
             residual_rms=residual,
             includes_reflection=includes_reflection,
+            affine=affine_decomp,
         ),
         distances=DistanceInfo(
             chamfer_mean=dist["chamfer"],
@@ -521,6 +660,7 @@ def compare(
             "body_count": [metrics_a.body_count, metrics_b.body_count],
             "is_watertight": [metrics_a.is_watertight, metrics_b.is_watertight],
         },
+        transform_invariants=invariants,
         caveats=caveats,
         summary=(
             "NOTE: the best fit includes a reflection. "

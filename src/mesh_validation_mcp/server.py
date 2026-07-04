@@ -11,11 +11,13 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
-from .comparison import compare, localized_change
+from .comparison import _bounded_distances, compare, localized_change
 from .config import DEFAULT_RESOLUTION, VALIDATE_RESOLUTION
+from .golden import compare_to_reference
 from .integrity import integrity_flags
 from .loading import load_mesh
 from .metrics import MeshMetrics, compute_metrics
+from .oracles import PropertySpec, run_oracles
 from .rendering import (
     DEFAULT_VIEWS,
     highlight_face_colors,
@@ -277,6 +279,108 @@ def compare_meshes(
         resolution=DEFAULT_RESOLUTION,
         face_colors=colors,
         colorbar=colorbar,
+    )
+    payload["render"] = {"included": True, **meta}
+    return [_json(payload), *(Image(data=img, format="png") for img in images)]
+
+
+@mcp.tool(structured_output=False)
+def assert_properties(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh to check")],
+    properties: Annotated[
+        list[PropertySpec],
+        Field(
+            description="Named invariants to assert. Unary (after-mesh only): "
+            "preserves_watertight, non_self_intersecting. Binary (need reference_path): "
+            "conserves_volume, preserves_genus, preserves_euler, no_new_defects, "
+            "centroid_fixed, monotonic_offset (set direction: outward|inward), "
+            "bounded_hausdorff (set max_distance). Each may carry a tolerance "
+            '{relative, absolute}. Example: [{"name": "conserves_volume", "tolerance": '
+            '{"relative": 0.001}}, {"name": "no_new_defects"}].'
+        ),
+    ],
+    reference_path: Annotated[
+        str | None,
+        Field(description="Absolute path to the BEFORE mesh (required by binary oracles)"),
+    ] = None,
+    include_render: Annotated[
+        bool, Field(description="Append a 4-view render sheet of the checked mesh")
+    ] = True,
+) -> list[str | Image]:
+    """Assert named, operation-agnostic invariants about a manipulation: volume conserved,
+    watertight preserved, no new defects introduced, centroid fixed, an offset moved the
+    surface the right way, or the result stayed within a Hausdorff bound of a reference.
+    Every result carries a confidence tier and fails closed on unreliable input. Provide
+    reference_path for any before/after (binary) invariant."""
+    loaded = load_mesh(file_path)
+    metrics = compute_metrics(loaded)
+    before_metrics = None
+    hausdorff_upper: float | None = None
+    if reference_path is not None:
+        reference = load_mesh(reference_path)
+        before_metrics = compute_metrics(reference)
+        if any(p.name == "bounded_hausdorff" for p in properties):
+            diagonal = float(np.linalg.norm(reference.combined.extents)) or 1.0
+            hausdorff_upper = _bounded_distances(
+                loaded.combined, reference.combined, 2000, diagonal
+            )["hausdorff_upper"]
+
+    report = run_oracles(metrics, properties, before_metrics, hausdorff_upper)
+    payload: dict[str, Any] = report.model_dump()
+    payload["mesh"] = _mesh_summary(metrics)
+
+    if not include_render:
+        payload["render"] = {"included": False}
+        return [_json(payload)]
+
+    # Highlight self-intersections when an integrity-related invariant failed.
+    highlight_self_int = any(
+        not c.passed and c.name in ("non_self_intersecting", "no_new_defects")
+        for c in report.checks
+    )
+    face_colors = None
+    if highlight_self_int:
+        flagged = integrity_flags(loaded.combined)["self_intersection"]
+        if len(flagged):
+            face_colors = highlight_face_colors(loaded.combined, flagged)
+    images, meta = render_views(
+        loaded.combined, list(DEFAULT_VIEWS), resolution=VALIDATE_RESOLUTION, face_colors=face_colors
+    )
+    payload["render"] = {"included": True, **meta}
+    return [_json(payload), *(Image(data=img, format="png") for img in images)]
+
+
+@mcp.tool(structured_output=False)
+def compare_to_golden(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh you produced")],
+    reference_path: Annotated[
+        str, Field(description="Absolute path to the golden / reference mesh")
+    ],
+    tolerance: Annotated[
+        float,
+        Field(
+            description="Max allowed deviation in file units. On matching topology this is the "
+            "per-vertex tolerance for an EXACT match; otherwise it bounds the surface distance."
+        ),
+    ] = 1e-4,
+    include_render: Annotated[
+        bool, Field(description="Append a 4-view render sheet of the produced mesh")
+    ] = True,
+) -> list[str | Image]:
+    """Check whether a produced mesh matches a golden/reference mesh: "did I make the thing
+    I intended?" On matching topology it reports an EXACT per-vertex match (ordering-
+    independent); otherwise it bounds the surface distance to the reference. Returns
+    matches/exact_match plus the vertex delta or the Hausdorff bracket."""
+    produced = load_mesh(file_path)
+    reference = load_mesh(reference_path)
+    result = compare_to_reference(produced, reference, tolerance)
+
+    payload: dict[str, Any] = result.model_dump()
+    if not include_render:
+        payload["render"] = {"included": False}
+        return [_json(payload)]
+    images, meta = render_views(
+        produced.combined, list(DEFAULT_VIEWS), resolution=VALIDATE_RESOLUTION
     )
     payload["render"] = {"included": True, **meta}
     return [_json(payload), *(Image(data=img, format="png") for img in images)]

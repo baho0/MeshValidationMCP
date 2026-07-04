@@ -151,3 +151,29 @@ def flipped_path(tmp_path):
     faces[:5] = faces[:5][:, ::-1]
     mesh.faces = faces
     return _export(mesh, tmp_path / "flipped.stl")
+
+
+# --- Boolean / shell fixtures (need the manifold3d backend, a dev dependency) ---
+
+
+@pytest.fixture
+def boolean_operands(tmp_path):
+    """Two overlapping unit-1000 cubes plus their union/difference/intersection results."""
+    a = trimesh.creation.box((10, 10, 10))
+    b = trimesh.creation.box((10, 10, 10))
+    b.apply_translation((5, 0, 0))
+    paths = {
+        "a": _export(a, tmp_path / "bool_a.stl"),
+        "b": _export(b, tmp_path / "bool_b.stl"),
+        "union": _export(a.union(b), tmp_path / "bool_union.stl"),
+        "difference": _export(a.difference(b), tmp_path / "bool_diff.stl"),
+        "intersection": _export(a.intersection(b), tmp_path / "bool_inter.stl"),
+    }
+    return paths
+
+
+@pytest.fixture
+def shell_path(tmp_path):
+    """A 20mm cube hollowed by a 16mm cube => 2mm walls."""
+    shell = trimesh.creation.box((20, 20, 20)).difference(trimesh.creation.box((16, 16, 16)))
+    return _export(shell, tmp_path / "shell.stl")

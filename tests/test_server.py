@@ -22,6 +22,10 @@ async def test_list_tools():
             "assert_properties",
             "compare_to_golden",
             "inspect_section",
+            "measure_thickness",
+            "analyze_draft",
+            "fit_feature",
+            "validate_boolean",
         }
         validate = next(t for t in result.tools if t.name == "validate_mesh")
         schema = json.dumps(validate.inputSchema)

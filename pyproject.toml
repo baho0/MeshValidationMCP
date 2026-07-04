@@ -40,5 +40,6 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "anyio>=4.14.1",
+    "manifold3d>=3.5.2",
     "pytest>=9.1.1",
 ]

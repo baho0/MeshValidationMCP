@@ -11,13 +11,16 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
+from .boolean_validate import BooleanExpectations, validate_boolean as _validate_boolean
 from .comparison import _bounded_distances, compare, localized_change
 from .config import DEFAULT_RESOLUTION, VALIDATE_RESOLUTION
+from .features import DraftInfo, ThicknessInfo, draft_analysis, fit_region, wall_thickness
 from .golden import compare_to_reference
 from .integrity import integrity_flags
 from .loading import load_mesh
 from .metrics import MeshMetrics, compute_metrics
 from .oracles import PropertySpec, run_oracles
+from .region import Region
 from .section import SectionInfo, inspect_section as _inspect_section
 from .rendering import (
     DEFAULT_VIEWS,
@@ -409,6 +412,96 @@ def compare_to_golden(
         return [_json(payload)]
     images, meta = render_views(
         produced.combined, list(DEFAULT_VIEWS), resolution=VALIDATE_RESOLUTION
+    )
+    payload["render"] = {"included": True, **meta}
+    return [_json(payload), *(Image(data=img, format="png") for img in images)]
+
+
+@mcp.tool()
+def measure_thickness(
+    file_path: Annotated[str, Field(description="Absolute path to a watertight mesh")],
+    sample_count: Annotated[int, Field(description="Surface samples (500-8000)")] = 2000,
+) -> ThicknessInfo:
+    """Measure wall/feature thickness by inscribing the largest interior sphere at surface
+    samples. Reports min/p5/median/mean/max and the thinnest point. Use p5_thickness as the
+    robust thin-wall indicator (the bare min is biased low near sharp convex edges); use it
+    to verify a shell's min wall thickness. Requires a watertight mesh."""
+    return wall_thickness(load_mesh(file_path), sample_count)
+
+
+@mcp.tool()
+def analyze_draft(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh")],
+    pull_direction: Annotated[
+        list[float],
+        Field(description="Mold pull / de-mold direction [x,y,z]", min_length=3, max_length=3),
+    ],
+    min_draft_deg: Annotated[
+        float | None,
+        Field(description="If set, also report the pullable area below this draft angle"),
+    ] = None,
+) -> DraftInfo:
+    """Area-weighted draft/undercut analysis for a pull direction: the minimum draft angle
+    over pullable faces, and the total area (and face count) of undercuts — faces whose
+    normal points against the pull and so cannot be released. Draft is 90deg minus the
+    angle between a face normal and the pull direction (0 = vertical wall)."""
+    return draft_analysis(load_mesh(file_path), pull_direction, min_draft_deg)
+
+
+@mcp.tool(structured_output=False)
+def fit_feature(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh")],
+    region: Annotated[
+        Region,
+        Field(
+            description="The feature faces/vertices to fit (box/sphere/plane/vertex_ids/"
+            "face_ids region). e.g. a fillet band, a bore wall, or a chamfer face."
+        ),
+    ],
+    kind: Annotated[
+        Literal["plane", "sphere", "cylinder"],
+        Field(description="cylinder for a fillet/bore radius, plane for a chamfer, sphere for a dome"),
+    ],
+) -> list[str]:
+    """Fit a primitive (plane/sphere/cylinder) to the vertices a region selects and report
+    its parameters plus the RMS residual (the fit quality). This is how you measure a fillet
+    or bore radius, or confirm a chamfer is planar: select the feature with a region, fit a
+    cylinder/plane, and read radius/normal + residual."""
+    fit = fit_region(load_mesh(file_path), region, kind)
+    return [_json(fit.model_dump())]
+
+
+@mcp.tool(structured_output=False)
+def validate_boolean(
+    file_a: Annotated[str, Field(description="Absolute path to operand A")],
+    file_b: Annotated[str, Field(description="Absolute path to operand B")],
+    file_result: Annotated[str, Field(description="Absolute path to the boolean result mesh")],
+    operation: Annotated[
+        Literal["union", "difference", "intersection"],
+        Field(description="The boolean operation that produced the result (difference = A - B)"),
+    ],
+    tolerance: Annotated[
+        float, Field(description="Relative slack on the volume bounds (default 0.02)")
+    ] = 0.02,
+    include_render: Annotated[bool, Field(description="Append a render of the result")] = True,
+) -> list[str | Image]:
+    """Validate a boolean/CSG result against its operands: the result's integrity (watertight,
+    non-self-intersecting), the volume bounds the operation must satisfy (union:
+    max(Va,Vb)<=Vr<=Va+Vb; difference: Va-Vb<=Vr<=Va; intersection: Vr<=min(Va,Vb)), and
+    signed-distance containment (union contains both operands; a difference stays inside A and
+    clear of B). Catches the common failure where a seam self-intersects but reads watertight."""
+    loaded_result = load_mesh(file_result)
+    report = _validate_boolean(
+        load_mesh(file_a), load_mesh(file_b), loaded_result,
+        BooleanExpectations(operation=operation, tolerance=tolerance),
+    )
+    payload: dict[str, Any] = report.model_dump()
+    payload["result_mesh"] = _mesh_summary(compute_metrics(loaded_result))
+    if not include_render:
+        payload["render"] = {"included": False}
+        return [_json(payload)]
+    images, meta = render_views(
+        loaded_result.combined, list(DEFAULT_VIEWS), resolution=VALIDATE_RESOLUTION
     )
     payload["render"] = {"included": True, **meta}
     return [_json(payload), *(Image(data=img, format="png") for img in images)]

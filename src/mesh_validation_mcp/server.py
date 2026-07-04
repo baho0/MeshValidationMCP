@@ -13,6 +13,10 @@ from pydantic import Field
 
 from .array_validate import ArrayPattern, validate_array as _validate_array
 from .boolean_validate import BooleanExpectations, validate_boolean as _validate_boolean
+from .clearance import ClearanceInfo, check_clearance as _check_clearance
+from .dfm import DfmExpectations, dfm_report as _dfm_report
+from .silhouette import SilhouetteComparison, silhouette_compare as _silhouette_compare
+from .units import UnitsReport, units_report as _units_report
 from .comparison import SignedField, _bounded_distances, compare, localized_change, signed_field
 from .generative_validate import (
     ExtrudeExpectations,
@@ -60,6 +64,20 @@ inspect the pass/fail report and the rendered views -> fix the code -> repeat.
 - validate_mesh also checks mesh INTEGRITY (self-intersections, non-manifold/boundary edges,
   slivers, duplicate/flipped faces) — boolean-based edits often break these while still
   reporting watertight=true, which makes the volume check silently wrong.
+
+Beyond the core loop, tools cover specific manipulation families. Each result carries a
+`confidence` tier (exact | topological | sampled | estimated) and an error bound, and every
+check fails CLOSED on unreliable input (a non-watertight/self-intersecting volume never
+silently PASSes):
+- assert_properties: named before/after invariants (conserves_volume, preserves_watertight/
+  genus, no_new_defects, centroid_fixed, monotonic_offset, bounded_hausdorff).
+- compare_to_golden: does the output match a reference mesh (exact per-vertex or bounded surface)?
+- inspect_section: cross-section area/perimeter/loops (exact); measure_thickness (min wall);
+  analyze_draft (undercuts); fit_feature (fillet/bore radius, chamfer plane via primitive fit).
+- validate_boolean: union/difference/intersection volume bounds + containment + seam integrity.
+- detect_symmetry; validate_array (linear/polar); validate_generative (extrude/revolve by
+  volume signature); measure_displacement (whole-mesh deformation field); validate_remesh.
+- check_clearance (assembly fit); compare_silhouette (outline preserved); units_sanity; validate_dfm.
 
 Rules of thumb:
 - All file paths must be ABSOLUTE; the server's working directory is not yours.
@@ -637,6 +655,88 @@ def validate_remesh(
             min_triangle_quality=min_triangle_quality,
         ),
     )
+    return [_json(report.model_dump())]
+
+
+@mcp.tool()
+def check_clearance(
+    file_a: Annotated[str, Field(description="Absolute path to part A")],
+    file_b: Annotated[str, Field(description="Absolute path to part B")],
+    min_clearance: Annotated[
+        float | None, Field(description="If set, require at least this gap between the parts")
+    ] = None,
+) -> ClearanceInfo:
+    """Check whether two parts interfere and, if not, how close they come. Reports interference
+    (with penetration depth for watertight parts) and the minimum surface-to-surface clearance.
+    Use it to verify an assembly fit or a required gap. Interference and clearance are sampled."""
+    return _check_clearance(load_mesh(file_a), load_mesh(file_b), min_clearance)
+
+
+@mcp.tool()
+def compare_silhouette(
+    file_a: Annotated[str, Field(description="Absolute path to the BEFORE mesh")],
+    file_b: Annotated[str, Field(description="Absolute path to the AFTER mesh")],
+    view_axis: Annotated[
+        Literal["x", "y", "z"], Field(description="Orthographic view direction")
+    ] = "z",
+    resolution: Annotated[int, Field(description="Raster resolution in pixels")] = 256,
+) -> SilhouetteComparison:
+    """Compare the orthographic silhouettes (outlines) of two meshes from a canonical direction:
+    intersection-over-union plus one-way coverage. Use it to confirm an edit did NOT change the
+    profile (an emboss/texture pass should keep IoU ~1). Coarse and view-dependent."""
+    return _silhouette_compare(load_mesh(file_a), load_mesh(file_b), view_axis, resolution)
+
+
+@mcp.tool()
+def units_sanity(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh")],
+    expected_units: Annotated[
+        str | None, Field(description="Units the file should declare (e.g. 'mm')")
+    ] = None,
+    plausible_min_diagonal: Annotated[
+        float | None, Field(description="Smallest plausible bbox diagonal")
+    ] = None,
+    plausible_max_diagonal: Annotated[
+        float | None, Field(description="Largest plausible bbox diagonal")
+    ] = None,
+) -> UnitsReport:
+    """Sanity-check units and scale, and probe sampling self-consistency. Confirms the declared
+    units and that the overall size is plausible (catching unit mix-ups), and recomputes a
+    sampled probe at a second seed to confirm the sampled metrics are stable and deterministic."""
+    rng = None
+    if plausible_min_diagonal is not None and plausible_max_diagonal is not None:
+        rng = (plausible_min_diagonal, plausible_max_diagonal)
+    return _units_report(load_mesh(file_path), expected_units, rng)
+
+
+@mcp.tool(structured_output=False)
+def validate_dfm(
+    file_path: Annotated[str, Field(description="Absolute path to the part")],
+    min_wall_thickness: Annotated[
+        float | None, Field(description="Minimum allowed wall thickness")
+    ] = None,
+    pull_direction: Annotated[
+        list[float] | None,
+        Field(description="Mold pull direction [x,y,z] for the draft/undercut check", min_length=3, max_length=3),
+    ] = None,
+    min_draft_deg: Annotated[float, Field(description="Required draft angle for pullable faces")] = 0.0,
+    max_undercut_area: Annotated[float, Field(description="Allowed undercut area")] = 0.0,
+    check_trapped_voids: Annotated[
+        bool, Field(description="Flag fully enclosed internal cavities")
+    ] = True,
+) -> list[str]:
+    """Pure-geometry design-for-manufacturing check: composes minimum wall thickness, undercut
+    area / draft angle for a pull direction, and a trapped-void (enclosed cavity) test into one
+    verdict. This is geometric only (no materials/process model). Wall thickness uses the robust
+    p5 indicator, which is conservative near sharp edges."""
+    exp = DfmExpectations(
+        min_wall_thickness=min_wall_thickness,
+        pull_direction=pull_direction,
+        min_draft_deg=min_draft_deg,
+        max_undercut_area=max_undercut_area,
+        check_trapped_voids=check_trapped_voids,
+    )
+    report = _dfm_report(load_mesh(file_path), exp)
     return [_json(report.model_dump())]
 
 

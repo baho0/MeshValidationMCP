@@ -35,6 +35,17 @@ write code → export mesh → validate_mesh → inspect report + renders → fi
   reporting translation vector, rotation axis/angle and uniform scale
 - **Distance metrics** — sampled chamfer and Hausdorff distances, plus a displacement
   heatmap render
+- **Confidence tiers & fail-closed checks** — every check and distance is tagged with how
+  it was derived (`exact` | `topological` | `sampled` | `estimated`) and a numeric error
+  bound; a volume that cannot be trusted (non-watertight, winding-inconsistent, or
+  self-intersecting mesh) *fails* rather than silently passing
+- **Property oracles** — named before/after invariants any operation can assert
+  (`conserves_volume`, `preserves_watertight`/`genus`, `no_new_defects`, `centroid_fixed`,
+  `monotonic_offset`, `bounded_hausdorff`) and golden/reference matching
+- **Feature & operation validators** — cross-sections, wall thickness, draft/undercut,
+  fillet/bore fitting, boolean/CSG volume-bound + containment checks, symmetry, linear/polar
+  arrays, extrude/revolve (by volumetric signature), remesh, clearance, silhouette and a
+  pure-geometry DfM composite
 - **Agent-friendly errors** — failures return a structured JSON envelope
   (`{"code", "message", "hint"}`) the caller can parse and act on
 - **Deterministic output** — fixed seeds, cameras and lighting; identical inputs produce
@@ -73,7 +84,31 @@ claude mcp add mesh-validator --scope user -- \
 | `validate_mesh(file_path, expectations, include_render?)` | Check a mesh against structured geometry + integrity expectations; returns a pass/fail report and a 4-view render (defects highlighted) |
 | `inspect_mesh(file_path)` | Full geometric + integrity report — use it to ground truth a mesh before writing expectations |
 | `render_mesh(file_path, views?, style?, resolution?, combine?)` | Render canonical views (`iso`, `front`, `top`, ...) without running checks |
-| `compare_meshes(file_a, file_b, localized?, sample_count?, include_render?)` | Detect and classify the transform between two meshes; distances, metric deltas, displacement heatmap, and (with `localized`) region-scoped change verification |
+| `compare_meshes(file_a, file_b, localized?, sample_count?, include_render?)` | Detect and classify the transform (now incl. `affine` shear/anisotropic scale) between two meshes; distances, metric deltas, transform-invariant assertions, displacement heatmap, and (with `localized`) region-scoped change verification |
+
+### Advanced validation tools
+
+Each returns results tagged with a `confidence` tier and error bound, and fails closed on
+unreliable input.
+
+| Tool | Purpose |
+|------|---------|
+| `assert_properties(file_path, properties, reference_path?)` | Assert named before/after invariants (volume conserved, watertight/genus preserved, no new defects, centroid fixed, monotonic offset, bounded Hausdorff) |
+| `compare_to_golden(file_path, reference_path, tolerance?)` | Does the output match a reference — exact per-vertex (matching topology) or bounded surface distance |
+| `inspect_section(file_path, plane_origin, plane_normal)` | Planar cross-section: per-loop perimeter and net/gross area (exact) |
+| `measure_thickness(file_path, sample_count?)` | Inscribed-sphere wall/feature thickness (min/p5/median) |
+| `analyze_draft(file_path, pull_direction, min_draft_deg?)` | Area-weighted draft angle and undercut area for a pull direction |
+| `fit_feature(file_path, region, kind)` | Fit a plane/sphere/cylinder to selected feature faces (fillet/bore radius, chamfer) with residual |
+| `validate_boolean(file_a, file_b, file_result, operation, ...)` | Boolean/CSG result: volume bounds + signed-distance containment + seam integrity |
+| `detect_symmetry(file_path, rel_tolerance?)` | Mirror planes and rotational fold |
+| `validate_array(file_result, file_base, pattern)` | Linear/polar array: count, congruence, positions |
+| `validate_generative(file_path, operation, profile_area, ...)` | Extrude (area × height) / revolve (Pappus) by volume signature |
+| `measure_displacement(file_a, file_b)` | Whole-mesh signed displacement field (deformation) |
+| `validate_remesh(file_before, file_after, max_deviation, ...)` | Retessellation kept shape + topology + quality |
+| `check_clearance(file_a, file_b, min_clearance?)` | Assembly interference / minimum clearance |
+| `compare_silhouette(file_a, file_b, view_axis?, resolution?)` | Orthographic outline IoU (profile preserved) |
+| `units_sanity(file_path, expected_units?, ...)` | Units/scale plausibility + sampling self-consistency |
+| `validate_dfm(file_path, min_wall_thickness?, pull_direction?, ...)` | Pure-geometry DfM: min wall + draft/undercut + trapped voids |
 
 All file paths must be absolute. All values are interpreted in the file's native units.
 Renders use a Z-up convention: `front` looks along +Y, `iso` views from the (+X, −Y, +Z)
@@ -146,15 +181,22 @@ distance, fails the check.
 
 ```
 src/mesh_validation_mcp/
-├── server.py        # MCP wiring (the only module importing the mcp SDK)
-├── loading.py       # file loading and normalization
-├── metrics.py       # geometric metric computation
-├── integrity.py     # mesh-integrity metrics (self-intersection, manifoldness, quality)
-├── region.py        # Region primitive (box/sphere/plane/vertex-ids/face-ids)
-├── validation.py    # expectations schema and assertion engine
-├── comparison.py    # transform detection, distances, localized change, heatmap scalars
-└── rendering/       # camera math, backends, contact-sheet composition
-tests/               # unit tests + in-memory MCP integration tests
+├── server.py            # MCP wiring (the only module importing the mcp SDK)
+├── loading.py           # file loading and normalization
+├── confidence.py        # confidence tiers + numeric error bounds
+├── metrics.py           # geometric metrics (+ cross-checks, topology, curvature, inertia)
+├── integrity.py         # mesh-integrity metrics (self-intersection, manifoldness, quality)
+├── region.py            # Region primitive (box/sphere/plane/vertex-ids/face-ids)
+├── validation.py        # expectations schema and assertion engine (fail-closed)
+├── comparison.py        # transform/affine detection, distances, signed field, localized change
+├── oracles.py           # named property oracles + golden.py reference matching
+├── section.py           # planar cross-sections and section-area profiles
+├── curvature.py primitives.py topology.py   # curvature, primitive fits, genus/loops
+├── features.py          # wall thickness, draft/undercut, region primitive fits
+├── boolean_validate.py array_validate.py generative_validate.py remesh_validate.py
+├── symmetry.py clearance.py silhouette.py units.py dfm.py
+└── rendering/           # camera math, backends, contact-sheet composition
+tests/                   # unit tests + in-memory MCP integration tests
 ```
 
 ```bash

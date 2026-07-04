@@ -501,6 +501,74 @@ def _bounded_distances(
     }
 
 
+class SignedField(BaseModel):
+    """Whole-mesh signed displacement field between a before- and after-mesh — the region-free
+    generalization of localized_change. Positive = surface moved outward (inflate/offset out)."""
+
+    same_topology: bool
+    max_displacement: float
+    mean_displacement: float
+    signed_peak: float | None  # 95th-percentile-magnitude signed motion along the normal
+    outward_fraction: float
+    direction_consistency: float  # 1 = every moved vertex went the same way (coherent offset)
+    volume_delta: float | None
+    area_delta: float
+    confidence: Confidence
+    caveats: list[str]
+
+
+def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
+    """Per-vertex signed displacement of B relative to A over the whole surface."""
+    a, b = loaded_a.combined, loaded_b.combined
+    diagonal = float(np.linalg.norm(a.extents)) or 1.0
+    tiny = 1e-6 * diagonal
+    caveats: list[str] = []
+
+    same_topology = len(a.vertices) == len(b.vertices) and np.array_equal(a.faces, b.faces)
+    if same_topology:
+        delta = np.asarray(b.vertices) - np.asarray(a.vertices)
+        displacement = np.linalg.norm(delta, axis=1)
+        outward = np.einsum("ij,ij->i", delta, np.asarray(a.vertex_normals))
+        conf = exact("per-vertex displacement (matching topology)")
+    else:
+        bverts = np.asarray(b.vertices)
+        _c, displacement, _t = trimesh.proximity.closest_point(a, bverts)
+        if a.is_watertight:
+            outward = -np.asarray(trimesh.proximity.signed_distance(a, bverts))
+        else:
+            outward = displacement.copy()
+            caveats.append("before-mesh not watertight: outward sign unavailable")
+        conf = sampled("closest-point displacement (differing topology)", diagonal / np.sqrt(len(bverts)))
+        caveats.append("topology differs: displacement measured to A's surface; approximate")
+
+    moved = displacement > tiny
+    signed = _signed_displacement(outward[moved]) if moved.any() else _signed_displacement(np.array([]))
+    if moved.any():
+        signs = np.sign(outward[moved])
+        direction_consistency = float(abs(signs.mean()))
+    else:
+        direction_consistency = 1.0
+
+    va, vb = _finite_volume(a), _finite_volume(b)
+    return SignedField(
+        same_topology=same_topology,
+        max_displacement=float(displacement.max()) if displacement.size else 0.0,
+        mean_displacement=float(displacement.mean()) if displacement.size else 0.0,
+        signed_peak=signed.peak,
+        outward_fraction=signed.outward_fraction,
+        direction_consistency=direction_consistency,
+        volume_delta=(vb - va) if (va is not None and vb is not None) else None,
+        area_delta=float(b.area - a.area),
+        confidence=conf,
+        caveats=caveats,
+    )
+
+
+def _finite_volume(mesh: trimesh.Trimesh) -> float | None:
+    v = float(mesh.volume)
+    return v if math.isfinite(v) else None
+
+
 def _heatmap_scalars(a: trimesh.Trimesh, b: trimesh.Trimesh) -> np.ndarray:
     """Per-vertex distance from B's vertices to A's surface."""
     vertices = np.asarray(b.vertices)

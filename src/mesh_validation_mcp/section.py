@@ -73,6 +73,56 @@ def _point_in_polygon(point: np.ndarray, poly: np.ndarray) -> bool:
     return inside
 
 
+class SectionProfile(BaseModel):
+    axis: list[float]
+    stations: list[float]  # signed positions along the axis (relative to the first station)
+    areas: list[float]  # net cross-section area at each station
+    perimeters: list[float]
+    area_constant: bool  # every area within 2% of the mean (an extrusion/prism signature)
+    area_monotonic: bool  # areas strictly increase or decrease (a taper signature)
+    confidence: Confidence
+    caveats: list[str]
+
+
+def section_area_profile(
+    loaded: LoadedMesh, axis: list[float], stations: int = 9
+) -> SectionProfile:
+    """Cross-section area sampled at several stations along an axis. A constant profile is the
+    signature of an extrusion/prism; a monotonic profile is a taper; a wobble is a twist or a
+    local feature. Stations span the mesh's extent along the axis (endpoints inset slightly)."""
+    mesh = loaded.combined
+    n = np.asarray(axis, dtype=float)
+    n = n / (np.linalg.norm(n) or 1.0)
+    proj = np.asarray(mesh.vertices) @ n
+    lo, hi = float(proj.min()), float(proj.max())
+    span = hi - lo
+    ts = np.linspace(lo + 0.05 * span, hi - 0.05 * span, stations)
+
+    areas: list[float] = []
+    perims: list[float] = []
+    for t in ts:
+        info = inspect_section(loaded, [float(x) for x in n * t], [float(x) for x in n])
+        areas.append(info.net_area)
+        perims.append(info.total_perimeter)
+
+    arr = np.asarray(areas)
+    mean = float(arr.mean()) or 1.0
+    area_constant = bool(np.all(np.abs(arr - mean) <= 0.02 * abs(mean)))
+    diffs = np.diff(arr)
+    area_monotonic = bool(np.all(diffs > 0) or np.all(diffs < 0))
+
+    return SectionProfile(
+        axis=[float(x) for x in n],
+        stations=[float(t - ts[0]) for t in ts],
+        areas=areas,
+        perimeters=perims,
+        area_constant=area_constant,
+        area_monotonic=area_monotonic,
+        confidence=exact("net section area at stations along the axis"),
+        caveats=[],
+    )
+
+
 def inspect_section(
     loaded: LoadedMesh, plane_origin: list[float], plane_normal: list[float]
 ) -> SectionInfo:

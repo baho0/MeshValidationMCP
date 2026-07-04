@@ -11,9 +11,19 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
+from .array_validate import ArrayPattern, validate_array as _validate_array
 from .boolean_validate import BooleanExpectations, validate_boolean as _validate_boolean
-from .comparison import _bounded_distances, compare, localized_change
+from .comparison import SignedField, _bounded_distances, compare, localized_change, signed_field
+from .generative_validate import (
+    ExtrudeExpectations,
+    RevolveExpectations,
+    validate_extrude as _validate_extrude,
+    validate_revolve as _validate_revolve,
+)
+from .remesh_validate import RemeshExpectations, validate_remesh as _validate_remesh
+from .symmetry import SymmetryInfo, detect_symmetry as _detect_symmetry
 from .config import DEFAULT_RESOLUTION, VALIDATE_RESOLUTION
+from .errors import ErrorCode, MeshToolError
 from .features import DraftInfo, ThicknessInfo, draft_analysis, fit_region, wall_thickness
 from .golden import compare_to_reference
 from .integrity import integrity_flags
@@ -505,6 +515,129 @@ def validate_boolean(
     )
     payload["render"] = {"included": True, **meta}
     return [_json(payload), *(Image(data=img, format="png") for img in images)]
+
+
+@mcp.tool()
+def detect_symmetry(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh")],
+    rel_tolerance: Annotated[
+        float, Field(description="Symmetry tolerance as a fraction of the bbox diagonal")
+    ] = 1e-3,
+) -> SymmetryInfo:
+    """Detect mirror and rotational self-symmetry. Reports the mirror planes (from the
+    principal inertia axes, each confirmed by reflecting and measuring the surface distance)
+    and the largest rotational fold about a principal axis. Use it to verify a part that
+    should be symmetric actually is."""
+    return _detect_symmetry(load_mesh(file_path), rel_tolerance)
+
+
+@mcp.tool()
+def measure_displacement(
+    file_a: Annotated[str, Field(description="Absolute path to the BEFORE mesh")],
+    file_b: Annotated[str, Field(description="Absolute path to the AFTER mesh")],
+) -> SignedField:
+    """Whole-mesh signed displacement field between before and after (the region-free
+    deformation measure). Reports max/mean displacement, the signed peak along the surface
+    normal (+ outward), the outward fraction, a direction-consistency score (1 = a coherent
+    offset, ~0 = tangential/twist), and the volume/area deltas. Use it to characterize a
+    deform/offset/morph over the whole part."""
+    return signed_field(load_mesh(file_a), load_mesh(file_b))
+
+
+@mcp.tool(structured_output=False)
+def validate_array(
+    file_result: Annotated[str, Field(description="Absolute path to the arrayed result mesh")],
+    file_base: Annotated[str, Field(description="Absolute path to the single base instance")],
+    pattern: Annotated[
+        ArrayPattern,
+        Field(
+            description="The expected pattern. Linear: {kind:'linear', count, step:[x,y,z]}. "
+            "Polar: {kind:'polar', count, axis:[x,y,z], center:[x,y,z], angle_deg}."
+        ),
+    ],
+) -> list[str]:
+    """Validate a linear or polar array: the instance count, that every instance is congruent
+    to the base (checked with the rigid invariants volume + principal inertia, no registration
+    needed), and that the instances sit at the predicted grid/fan positions."""
+    report = _validate_array(load_mesh(file_result), load_mesh(file_base), pattern)
+    return [_json(report.model_dump())]
+
+
+@mcp.tool(structured_output=False)
+def validate_generative(
+    file_path: Annotated[str, Field(description="Absolute path to the generated solid")],
+    operation: Annotated[
+        Literal["extrude", "revolve"], Field(description="The generative operation")
+    ],
+    profile_area: Annotated[float, Field(description="Area of the 2D profile", gt=0)],
+    height: Annotated[
+        float | None, Field(description="Extrude only: extrusion height")
+    ] = None,
+    profile_centroid_radius: Annotated[
+        float | None,
+        Field(description="Revolve only: distance of the profile centroid from the axis"),
+    ] = None,
+    axis: Annotated[
+        list[float], Field(description="Extrude axis [x,y,z]", min_length=3, max_length=3)
+    ] = [0.0, 0.0, 1.0],
+) -> list[str]:
+    """Validate an extrude or revolve by its exact volumetric signature. Extrude: volume =
+    profile_area x height and a constant cross-section along the axis. Revolve: volume =
+    2*pi*profile_centroid_radius*profile_area (Pappus). Volume checks fail closed on a
+    non-watertight result."""
+    loaded = load_mesh(file_path)
+    if operation == "extrude":
+        if height is None:
+            raise MeshToolError(
+                ErrorCode.INVALID_EXPECTATION, "extrude needs 'height'", "Provide the extrusion height."
+            )
+        report = _validate_extrude(
+            loaded, ExtrudeExpectations(profile_area=profile_area, height=height, axis=axis)
+        )
+    else:
+        if profile_centroid_radius is None:
+            raise MeshToolError(
+                ErrorCode.INVALID_EXPECTATION,
+                "revolve needs 'profile_centroid_radius'",
+                "Provide the profile centroid's distance from the revolve axis.",
+            )
+        report = _validate_revolve(
+            loaded,
+            RevolveExpectations(
+                profile_area=profile_area, profile_centroid_radius=profile_centroid_radius
+            ),
+        )
+    return [_json(report.model_dump())]
+
+
+@mcp.tool(structured_output=False)
+def validate_remesh(
+    file_before: Annotated[str, Field(description="Absolute path to the original mesh")],
+    file_after: Annotated[str, Field(description="Absolute path to the remeshed mesh")],
+    max_deviation: Annotated[
+        float, Field(description="Max allowed surface distance to the original", gt=0)
+    ],
+    preserve_topology: Annotated[
+        bool, Field(description="Require watertightness and genus to be unchanged")
+    ] = True,
+    min_triangle_quality: Annotated[
+        float | None, Field(description="Optional floor on triangle quality (0=sliver, 1=equilateral)")
+    ] = None,
+) -> list[str]:
+    """Validate a remesh/simplify/subdivide: the surface stayed within max_deviation of the
+    original (bounded vertex-to-surface distance), the topology (watertight + genus) is
+    unchanged, and triangle quality holds above an optional floor. One verdict for
+    'retessellation didn't change the object'."""
+    report = _validate_remesh(
+        load_mesh(file_before),
+        load_mesh(file_after),
+        RemeshExpectations(
+            max_deviation=max_deviation,
+            preserve_topology=preserve_topology,
+            min_triangle_quality=min_triangle_quality,
+        ),
+    )
+    return [_json(report.model_dump())]
 
 
 def main() -> None:

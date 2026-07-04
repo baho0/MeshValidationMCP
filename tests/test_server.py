@@ -26,6 +26,11 @@ async def test_list_tools():
             "analyze_draft",
             "fit_feature",
             "validate_boolean",
+            "detect_symmetry",
+            "measure_displacement",
+            "validate_array",
+            "validate_generative",
+            "validate_remesh",
         }
         validate = next(t for t in result.tools if t.name == "validate_mesh")
         schema = json.dumps(validate.inputSchema)

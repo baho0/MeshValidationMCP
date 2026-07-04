@@ -25,6 +25,26 @@ class BodyMetrics(BaseModel):
     bounds: Bounds
 
 
+class CrossChecks(BaseModel):
+    """Redundant, independent derivations of the same quantities. When two paths to the
+    'same' number disagree, the mesh is pathological and the primary metric should not be
+    trusted — `consistent` is the single flag an oracle can gate on."""
+
+    # Volume by the divergence theorem vs by summing per-body signed volumes.
+    volume_divergence: float | None
+    volume_body_sum: float | None
+    volume_agreement: bool | None  # None when volume is unreliable (open/inconsistent)
+    # Euler characteristic by V-E+F vs by the Gauss-Bonnet angle-defect sum / 2*pi.
+    euler_number: int
+    euler_gauss_bonnet: float | None
+    euler_agreement: bool | None
+    # The is_watertight flag vs the independent "no boundary edges" test.
+    watertight_flag: bool
+    boundary_free: bool
+    watertight_agreement: bool
+    consistent: bool
+
+
 class MeshMetrics(BaseModel):
     path: str
     format: str
@@ -46,6 +66,7 @@ class MeshMetrics(BaseModel):
     bbox_diagonal: float
     units: str | None
     integrity: IntegrityMetrics
+    cross_checks: CrossChecks
     bodies: list[BodyMetrics]
     caveats: list[str]
 
@@ -57,6 +78,60 @@ def _finite(value: float) -> float | None:
 
 def _vec(value: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(value).ravel()]
+
+
+def _cross_checks(
+    mesh: trimesh.Trimesh,
+    bodies: list[trimesh.Trimesh],
+    integrity: IntegrityMetrics,
+    volume: float | None,
+    reliable: bool,
+) -> CrossChecks:
+    watertight = bool(mesh.is_watertight)
+    boundary_free = integrity.boundary_edge_count == 0
+
+    # Volume by an independent path: sum of per-body signed volumes (catches a body with
+    # inverted winding whose negative volume the divergence sum would otherwise hide).
+    body_sum: float | None = None
+    volume_agreement: bool | None = None
+    if reliable and volume is not None:
+        try:
+            body_sum = float(sum(float(b.volume) for b in bodies))
+            volume_agreement = abs(body_sum - volume) <= 1e-4 * max(abs(volume), 1.0)
+        except Exception:
+            body_sum, volume_agreement = None, None
+
+    # Euler characteristic by Gauss-Bonnet: on a CLOSED surface the angle-defect sum equals
+    # 2*pi*chi exactly. An open surface carries a boundary term, so we only cross-check when
+    # watertight (the value is still reported for information).
+    euler_gb: float | None = None
+    euler_agreement: bool | None = None
+    try:
+        defects = trimesh.curvature.vertex_defects(mesh)
+        euler_gb = float(np.asarray(defects).sum() / (2.0 * math.pi))
+        if watertight:
+            euler_agreement = abs(euler_gb - mesh.euler_number) <= 0.5
+    except Exception:
+        euler_gb, euler_agreement = None, None
+
+    watertight_agreement = watertight == boundary_free
+    consistent = (
+        (volume_agreement is not False)
+        and (euler_agreement is not False)
+        and watertight_agreement
+    )
+    return CrossChecks(
+        volume_divergence=volume,
+        volume_body_sum=body_sum,
+        volume_agreement=volume_agreement,
+        euler_number=int(mesh.euler_number),
+        euler_gauss_bonnet=euler_gb,
+        euler_agreement=euler_agreement,
+        watertight_flag=watertight,
+        boundary_free=boundary_free,
+        watertight_agreement=watertight_agreement,
+        consistent=consistent,
+    )
 
 
 def _body_metrics(body: trimesh.Trimesh) -> BodyMetrics:
@@ -91,6 +166,24 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
         caveats.append("negative_volume: face normals point inward (inverted winding)")
 
     integrity = compute_integrity(mesh)
+    cross = _cross_checks(mesh, loaded.bodies, integrity, volume, reliable)
+    if not cross.consistent:
+        reasons = []
+        if cross.euler_agreement is False:
+            reasons.append(
+                f"euler mismatch (V-E+F={cross.euler_number} vs Gauss-Bonnet "
+                f"{cross.euler_gauss_bonnet:.3g})"
+            )
+        if cross.volume_agreement is False:
+            reasons.append(
+                f"volume paths disagree (divergence={cross.volume_divergence:.6g} vs "
+                f"body-sum={cross.volume_body_sum:.6g})"
+            )
+        if not cross.watertight_agreement:
+            reasons.append(
+                f"is_watertight={cross.watertight_flag} but boundary_free={cross.boundary_free}"
+            )
+        caveats.append("cross_check_inconsistent: " + "; ".join(reasons))
     if integrity.self_intersecting_face_count > 0:
         caveats.append(
             f"self_intersecting: {integrity.self_intersecting_face_count} faces intersect; "
@@ -125,6 +218,7 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
         bbox_diagonal=float(np.linalg.norm(extents)),
         units=str(mesh.units) if mesh.units else None,
         integrity=integrity,
+        cross_checks=cross,
         bodies=[_body_metrics(b) for b in loaded.bodies],
         caveats=caveats,
     )

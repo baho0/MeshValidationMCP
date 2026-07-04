@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .confidence import Confidence, exact, sampled, topological
 from .errors import ErrorCode, MeshToolError
 from .metrics import MeshMetrics
 from .region import Region
@@ -46,6 +47,53 @@ SUPPORTED_KEYS = (
 )
 
 _TINY = 1e-12
+
+# Confidence basis per check key. Everything an assertion touches here is an exact
+# combinatorial or analytic quantity except body_count (a topological invariant),
+# volume on an unreliable mesh, and an unverified self-intersection count.
+_EXACT_BASIS = {
+    "volume": "divergence-theorem volume (watertight, consistent winding)",
+    "surface_area": "sum of triangle areas",
+    "bbox_min": "coordinate extrema",
+    "bbox_max": "coordinate extrema",
+    "bbox_extents": "coordinate extrema",
+    "centroid": "area-weighted triangle centroid",
+    "vertex_count": "vertex array length",
+    "face_count": "face array length",
+    "watertight": "edge-manifold test",
+    "winding_consistent": "winding-consistency test",
+    "euler_number": "V - E + F",
+    "min_triangle_quality": "analytic triangle quality",
+}
+_TOPO_BASIS = {"body_count": "connected-component count"}
+
+
+def _confidence_for(name: str, metrics: MeshMetrics) -> Confidence:
+    """Label a check's `actual` value with how it was derived (see confidence.py)."""
+    if name == "volume":
+        if metrics.volume_reliable:
+            return exact(_EXACT_BASIS["volume"])
+        return Confidence(
+            tier="estimated",
+            error_abs=None,
+            basis="divergence-theorem volume on a non-watertight / winding-inconsistent mesh "
+            "(unreliable)",
+        )
+    if name == "self_intersecting_face_count":
+        if metrics.integrity.self_intersection_checked:
+            return exact("Moller triangle-triangle intersection test")
+        return Confidence(
+            tier="estimated",
+            error_abs=None,
+            basis="self-intersection not verified (mesh exceeds the face cap)",
+        )
+    if name in _EXACT_BASIS:
+        return exact(_EXACT_BASIS[name])
+    if name in _TOPO_BASIS:
+        return topological(_TOPO_BASIS[name])
+    if name in _INTEGRITY_COUNT_KEYS:
+        return exact("combinatorial integrity count")
+    return exact("exact combinatorial/analytic quantity")
 
 
 class Tolerance(BaseModel):
@@ -128,6 +176,8 @@ class CheckResult(BaseModel):
     deviation_pct: float | None = None
     tolerance: dict[str, float | None] | None = None
     caveats: list[str] = Field(default_factory=list)
+    # How the `actual` value was derived and how much numeric slack rides on it.
+    confidence: Confidence | None = None
 
 
 class ValidationReport(BaseModel):
@@ -294,6 +344,33 @@ def _fail_detail(check: CheckResult) -> str:
     return f"FAIL {check.name}: expected {check.expected}, actual {check.actual}"
 
 
+def _volume_unreliable_reason(metrics: MeshMetrics) -> str | None:
+    """Why a volume/mass check must fail-closed, or None if the volume is trustworthy.
+
+    A watertight+consistent mesh can still self-intersect (common after boolean edits),
+    in which case trimesh's divergence volume is silently wrong — so a positive OR an
+    unverified self-intersection count also blocks a PASS. No silent pass on bad input.
+    """
+    if not metrics.volume_reliable:
+        return (
+            "volume is unreliable: the mesh is not watertight or its winding is inconsistent "
+            "(divergence-theorem volume cannot be trusted) — refusing to PASS the volume check"
+        )
+    integrity = metrics.integrity
+    if integrity.self_intersecting_face_count > 0:
+        return (
+            f"volume may be wrong: the mesh has {integrity.self_intersecting_face_count} "
+            "self-intersecting faces (watertight can read true while the volume is off) — "
+            "refusing to PASS the volume check"
+        )
+    if not integrity.self_intersection_checked:
+        return (
+            "volume reliability is unverified: the self-intersection test was skipped "
+            "(mesh exceeds the face cap) — refusing to PASS the volume check"
+        )
+    return None
+
+
 def evaluate(metrics: MeshMetrics, expectations: Expectations) -> ValidationReport:
     _reject_unknown_keys(expectations)
     tol = expectations.tolerance
@@ -303,6 +380,10 @@ def evaluate(metrics: MeshMetrics, expectations: Expectations) -> ValidationRepo
     if expectations.volume is not None:
         check = _scalar_check("volume", expectations.volume, metrics.volume, tol)
         check.caveats.extend(volume_caveats)
+        reason = _volume_unreliable_reason(metrics)
+        if reason is not None:
+            check.passed = False
+            check.caveats.append(reason)
         checks.append(check)
     if expectations.surface_area is not None:
         checks.append(
@@ -365,6 +446,10 @@ def evaluate(metrics: MeshMetrics, expectations: Expectations) -> ValidationRepo
             "Use render_mesh if you only want images.",
         )
 
+    for check in checks:
+        if check.confidence is None:
+            check.confidence = _confidence_for(check.name, metrics)
+
     failed = [c for c in checks if not c.passed]
     summary = f"{len(checks) - len(failed)}/{len(checks)} checks passed."
     if failed:
@@ -412,6 +497,16 @@ _SIDEWALL_CAVEAT = (
 def evaluate_change(change: LocalizedChange, exp: ChangeExpectations) -> ValidationReport:
     tol = exp.tolerance
     approx = [] if change.same_topology else ["measured on differing topology; approximate"]
+    # On matching topology the displacement is an exact per-vertex difference; otherwise
+    # it is a closest-point distance to A's surface, resolved to the change threshold.
+    conf = (
+        exact("per-vertex displacement (matching topology)")
+        if change.same_topology
+        else sampled(
+            "closest-point displacement to A's surface (differing topology)",
+            change.change_threshold,
+        )
+    )
     checks: list[CheckResult] = []
 
     if exp.max_unchanged_deviation is not None:
@@ -436,6 +531,9 @@ def evaluate_change(change: LocalizedChange, exp: ChangeExpectations) -> Validat
         check.caveats.append(_SIDEWALL_CAVEAT)
         check.caveats.extend(approx)
         checks.append(check)
+
+    for check in checks:
+        check.confidence = conf.model_copy()
 
     failed = [c for c in checks if not c.passed]
     if not checks:

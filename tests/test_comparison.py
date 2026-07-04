@@ -110,7 +110,25 @@ def test_deformed(box_path, sphere_path):
 
 def test_metric_deltas_and_seed(box_path, translated_path):
     report, _ = _compare(box_path, translated_path, sample_count=500)
-    assert report.distances.sample_count == 500
+    # Sampling is adaptive: the requested count is a floor, not an exact target.
+    assert report.distances.sample_count >= 500
     assert report.distances.seed == 0
     assert report.metric_deltas["face_count"] == [12, 12]
     assert report.metric_deltas["is_watertight"] == [True, True]
+
+
+def test_hausdorff_is_bounded(box_path, translated_path):
+    # The true Hausdorff must sit inside the reported [lower, upper] bracket, and the
+    # bracket must carry a sampled-tier confidence with a positive spacing error bound.
+    report, _ = _compare(box_path, translated_path)
+    d = report.distances
+    assert d.hausdorff_lower <= d.hausdorff_approx <= d.hausdorff_upper
+    assert d.hausdorff_upper > d.hausdorff_lower  # a real (non-degenerate) bracket
+    assert d.confidence is not None
+    assert d.confidence.tier == "sampled"
+    assert d.confidence.error_abs is not None and d.confidence.error_abs > 0
+
+
+def test_identical_hausdorff_bracket_is_tight(box_path):
+    report, _ = _compare(box_path, box_path)
+    assert report.distances.hausdorff_lower < 1e-6

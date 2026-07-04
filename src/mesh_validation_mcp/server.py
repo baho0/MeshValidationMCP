@@ -86,6 +86,7 @@ def _mesh_summary(metrics: MeshMetrics) -> dict[str, Any]:
         "volume": metrics.volume,
         "surface_area": metrics.surface_area,
         "integrity": metrics.integrity.model_dump(),
+        "cross_checks": metrics.cross_checks.model_dump(),
         "caveats": metrics.caveats,
     }
 

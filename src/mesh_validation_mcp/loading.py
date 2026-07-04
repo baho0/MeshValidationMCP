@@ -12,6 +12,13 @@ from .errors import ErrorCode, MeshToolError
 
 SUPPORTED_SUFFIXES = ("stl", "obj", "ply", "glb", "gltf", "off", "3mf")
 
+# STL stores unshared per-face vertices, so it MUST be merged on load or every vertex
+# reads as unmerged and the solid reads as open. Formats that store explicit shared
+# vertices are loaded WITHOUT processing so the author's exact vertex order survives a
+# re-export: that is what keeps the before/after correspondence in compare() /
+# localized_change on the exact path instead of silently demoting to ICP.
+_MERGE_ON_LOAD = frozenset({"stl"})
+
 
 @dataclass
 class LoadedMesh:
@@ -26,7 +33,13 @@ def _supported_hint() -> str:
     return f"Supported formats: {', '.join(SUPPORTED_SUFFIXES)}"
 
 
-def load_mesh(file_path: str) -> LoadedMesh:
+def load_mesh(file_path: str, process: bool | None = None) -> LoadedMesh:
+    """Load and normalize a mesh file.
+
+    ``process`` controls trimesh's on-load vertex merging. ``None`` (default) auto-selects
+    by format: merge STL (which has no shared-vertex concept on disk) and leave shared-vertex
+    formats untouched to preserve exact vertex correspondence. Pass an explicit bool to force.
+    """
     path = Path(file_path)
     if not path.is_absolute():
         raise MeshToolError(
@@ -57,8 +70,10 @@ def load_mesh(file_path: str) -> LoadedMesh:
             ErrorCode.UNSUPPORTED_FORMAT, f"Unsupported format: .{suffix}", _supported_hint()
         )
 
+    if process is None:
+        process = suffix in _MERGE_ON_LOAD
     try:
-        loaded = trimesh.load(str(path))
+        loaded = trimesh.load(str(path), process=process)
     except MeshToolError:
         raise
     except Exception as exc:

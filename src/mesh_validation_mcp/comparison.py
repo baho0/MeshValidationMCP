@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
+from .confidence import Confidence, sampled, sampling_error
 from .config import (
     HEATMAP_MAX_VERTICES,
     LOCALIZED_CHANGE_REL,
@@ -47,10 +48,17 @@ class TransformInfo(BaseModel):
 
 class DistanceInfo(BaseModel):
     chamfer_mean: float
+    # Hausdorff is estimated from surface samples: the sampled max is a strict LOWER
+    # bound on the true value; adding one sample-spacing gives an UPPER bound (a
+    # closest-point distance field is 1-Lipschitz, so an unsampled point sits within
+    # one spacing of a sample). `hausdorff_approx` == `hausdorff_lower` (back-compat).
     hausdorff_approx: float
+    hausdorff_lower: float
+    hausdorff_upper: float
     aligned_residual_rms: float
     sample_count: int
     seed: int
+    confidence: Confidence | None = None
 
 
 class ComparisonReport(BaseModel):
@@ -336,6 +344,45 @@ def localized_change(
     )
 
 
+def _bounded_distances(
+    a: trimesh.Trimesh, b: trimesh.Trimesh, requested: int, diagonal: float
+) -> dict[str, Any]:
+    """Adaptive surface sampling for chamfer + a *bounded* Hausdorff estimate.
+
+    Grows the sample count (from `requested`, capped) until the sampled max distance
+    stops climbing meaningfully, then returns both a strict lower bound (the sampled
+    max) and an upper bound (lower + one sample-spacing = diagonal/sqrt(n)). Keeping
+    the bound explicit stops a bare sampled max from masquerading as the true Hausdorff.
+    """
+    n = int(min(max(requested, 100), MAX_COMPARE_SAMPLES))
+    ceiling = int(min(max(requested, 100) * 8, MAX_COMPARE_SAMPLES))
+    prev: float | None = None
+    while True:
+        points_a, _ = trimesh.sample.sample_surface(a, n, seed=SEED)
+        points_b, _ = trimesh.sample.sample_surface(b, n, seed=SEED)
+        dist_a_to_b = trimesh.proximity.closest_point(b, points_a)[1]
+        dist_b_to_a = trimesh.proximity.closest_point(a, points_b)[1]
+        lower = float(max(dist_a_to_b.max(), dist_b_to_a.max()))
+        chamfer = float((dist_a_to_b.mean() + dist_b_to_a.mean()) / 2.0)
+        # Converge when another doubling barely moves the (monotone-ish) sampled max.
+        converged = prev is not None and lower - prev <= 0.02 * max(prev, 1e-12)
+        if converged or n >= ceiling:
+            break
+        prev = lower
+        n = min(n * 2, ceiling)
+    delta = sampling_error(n, diagonal)
+    return {
+        "points_a": points_a,
+        "dist_a_to_b": dist_a_to_b,
+        "dist_b_to_a": dist_b_to_a,
+        "hausdorff_lower": lower,
+        "hausdorff_upper": lower + delta,
+        "chamfer": chamfer,
+        "sample_count": n,
+        "spacing": delta,
+    }
+
+
 def _heatmap_scalars(a: trimesh.Trimesh, b: trimesh.Trimesh) -> np.ndarray:
     """Per-vertex distance from B's vertices to A's surface."""
     vertices = np.asarray(b.vertices)
@@ -364,6 +411,19 @@ def compare(
             scale=True, return_cost=True,
         )
         residual = float(np.sqrt(np.mean(np.sum((transformed - b.vertices) ** 2, axis=1))))
+        if residual > _THRESHOLDS["procrustes_exact"]["residual"] * diagonal:
+            # The proper (no-reflection) fit is poor; on matching topology B may be a
+            # mirror image. Retry allowing a reflection — if that fits cleanly it is a
+            # genuine mirror (flows to 'mirrored' below), not a deformation.
+            mirror_matrix, mirror_transformed, _mc = trimesh.registration.procrustes(
+                a.vertices, b.vertices, reflection=True, translation=True,
+                scale=True, return_cost=True,
+            )
+            mirror_residual = float(
+                np.sqrt(np.mean(np.sum((mirror_transformed - b.vertices) ** 2, axis=1)))
+            )
+            if mirror_residual < residual and float(np.linalg.det(mirror_matrix[:3, :3])) < 0:
+                matrix, residual = mirror_matrix, mirror_residual
     else:
         method = "icp"
         caveats.append(
@@ -417,11 +477,9 @@ def compare(
     if includes_reflection and residual <= _THRESHOLDS[method]["residual"] * diagonal:
         classification = "mirrored"
 
-    samples = int(min(max(sample_count, 100), MAX_COMPARE_SAMPLES))
-    points_a, _ = trimesh.sample.sample_surface(a, samples, seed=SEED)
-    points_b, _ = trimesh.sample.sample_surface(b, samples, seed=SEED)
-    dist_a_to_b = trimesh.proximity.closest_point(b, points_a)[1]
-    dist_b_to_a = trimesh.proximity.closest_point(a, points_b)[1]
+    dist = _bounded_distances(a, b, sample_count, diagonal)
+    points_a = dist["points_a"]
+    samples = dist["sample_count"]
     aligned = trimesh.proximity.closest_point(b, _apply(matrix, points_a))[1]
 
     metrics_a = compute_metrics(loaded_a)
@@ -442,11 +500,17 @@ def compare(
             includes_reflection=includes_reflection,
         ),
         distances=DistanceInfo(
-            chamfer_mean=float((dist_a_to_b.mean() + dist_b_to_a.mean()) / 2.0),
-            hausdorff_approx=float(max(dist_a_to_b.max(), dist_b_to_a.max())),
+            chamfer_mean=dist["chamfer"],
+            hausdorff_approx=dist["hausdorff_lower"],
+            hausdorff_lower=dist["hausdorff_lower"],
+            hausdorff_upper=dist["hausdorff_upper"],
             aligned_residual_rms=float(np.sqrt(np.mean(aligned**2))),
             sample_count=samples,
             seed=SEED,
+            confidence=sampled(
+                f"surface sampling n={samples} (Hausdorff bracket +/- one sample-spacing)",
+                dist["spacing"],
+            ).with_reference(dist["hausdorff_lower"]),
         ),
         metric_deltas={
             "volume": [metrics_a.volume, metrics_b.volume],

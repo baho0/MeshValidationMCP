@@ -18,6 +18,7 @@ from .integrity import integrity_flags
 from .loading import load_mesh
 from .metrics import MeshMetrics, compute_metrics
 from .oracles import PropertySpec, run_oracles
+from .section import SectionInfo, inspect_section as _inspect_section
 from .rendering import (
     DEFAULT_VIEWS,
     highlight_face_colors,
@@ -89,6 +90,14 @@ def _mesh_summary(metrics: MeshMetrics) -> dict[str, Any]:
         "surface_area": metrics.surface_area,
         "integrity": metrics.integrity.model_dump(),
         "cross_checks": metrics.cross_checks.model_dump(),
+        "topology": {
+            "genus_total": metrics.topology.genus_total,
+            "boundary_loop_count": metrics.topology.boundary_loop_count,
+        },
+        "curvature": {
+            "sharp_edge_count": metrics.curvature.sharp_edge_count,
+            "max_dihedral_deg": metrics.curvature.max_dihedral_deg,
+        },
         "caveats": metrics.caveats,
     }
 
@@ -348,6 +357,25 @@ def assert_properties(
     )
     payload["render"] = {"included": True, **meta}
     return [_json(payload), *(Image(data=img, format="png") for img in images)]
+
+
+@mcp.tool()
+def inspect_section(
+    file_path: Annotated[str, Field(description="Absolute path to the mesh file")],
+    plane_origin: Annotated[
+        list[float], Field(description="A point on the cutting plane [x,y,z]", min_length=3, max_length=3)
+    ],
+    plane_normal: Annotated[
+        list[float],
+        Field(description="The cutting plane normal [x,y,z] (need not be unit)", min_length=3, max_length=3),
+    ],
+) -> SectionInfo:
+    """Slice the mesh with a plane and measure the resulting 2D profile: the number of loops,
+    each loop's perimeter and area, and the net cross-section area (holes subtracted). Use it
+    to check an extrusion's constant cross-section, a prism/cylinder's analytic area, or that
+    a bore/pocket produced the intended profile. Area/perimeter are computed exactly from the
+    section polylines (no sampling)."""
+    return _inspect_section(load_mesh(file_path), plane_origin, plane_normal)
 
 
 @mcp.tool(structured_output=False)

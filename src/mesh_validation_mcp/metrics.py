@@ -8,8 +8,10 @@ import numpy as np
 import trimesh
 from pydantic import BaseModel
 
+from .curvature import CurvatureInfo, curvature_field
 from .integrity import IntegrityMetrics, compute_integrity
 from .loading import LoadedMesh
+from .topology import TopologyInfo, analyze_topology
 
 
 class Bounds(BaseModel):
@@ -23,6 +25,13 @@ class BodyMetrics(BaseModel):
     volume: float | None
     is_watertight: bool
     bounds: Bounds
+
+
+class InertiaInfo(BaseModel):
+    """Mass-distribution invariants (unit density). Defined only for a reliable solid."""
+
+    principal_moments: list[float]  # eigenvalues of the inertia tensor, ascending
+    principal_axes: list[list[float]]  # 3x3, rows are the principal directions
 
 
 class CrossChecks(BaseModel):
@@ -67,6 +76,9 @@ class MeshMetrics(BaseModel):
     units: str | None
     integrity: IntegrityMetrics
     cross_checks: CrossChecks
+    topology: TopologyInfo
+    curvature: CurvatureInfo
+    inertia: InertiaInfo | None
     bodies: list[BodyMetrics]
     caveats: list[str]
 
@@ -167,6 +179,20 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
 
     integrity = compute_integrity(mesh)
     cross = _cross_checks(mesh, loaded.bodies, integrity, volume, reliable)
+    topology = analyze_topology(loaded)
+    curvature = curvature_field(loaded)
+
+    inertia: InertiaInfo | None = None
+    if reliable:
+        try:
+            inertia = InertiaInfo(
+                principal_moments=_vec(mesh.principal_inertia_components),
+                principal_axes=[
+                    [float(x) for x in row] for row in np.asarray(mesh.principal_inertia_vectors)
+                ],
+            )
+        except Exception:
+            inertia = None
     if not cross.consistent:
         reasons = []
         if cross.euler_agreement is False:
@@ -219,6 +245,9 @@ def compute_metrics(loaded: LoadedMesh) -> MeshMetrics:
         units=str(mesh.units) if mesh.units else None,
         integrity=integrity,
         cross_checks=cross,
+        topology=topology,
+        curvature=curvature,
+        inertia=inertia,
         bodies=[_body_metrics(b) for b in loaded.bodies],
         caveats=caveats,
     )

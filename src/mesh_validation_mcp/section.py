@@ -73,6 +73,19 @@ def _point_in_polygon(point: np.ndarray, poly: np.ndarray) -> bool:
     return inside
 
 
+def section_cut_faces(
+    mesh: trimesh.Trimesh, plane_origin: list[float], plane_normal: list[float]
+) -> np.ndarray:
+    """Face ids the plane passes through (their vertices straddle the plane) — for an overlay
+    that shows WHERE the section was taken."""
+    n = np.asarray(plane_normal, dtype=float)
+    n = n / (np.linalg.norm(n) or 1.0)
+    signed = (np.asarray(mesh.vertices) - np.asarray(plane_origin, dtype=float)) @ n
+    face_signs = signed[mesh.faces]
+    straddles = (face_signs.min(axis=1) < 0) & (face_signs.max(axis=1) > 0)
+    return np.nonzero(straddles)[0]
+
+
 class SectionProfile(BaseModel):
     axis: list[float]
     stations: list[float]  # signed positions along the axis (relative to the first station)

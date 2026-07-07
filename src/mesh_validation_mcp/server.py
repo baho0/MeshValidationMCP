@@ -8,16 +8,22 @@ import math
 from typing import Annotated, Any, Literal
 
 import numpy as np
+import trimesh
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
 from .array_validate import ArrayPattern, validate_array as _validate_array
 from .boolean_validate import BooleanExpectations, validate_boolean as _validate_boolean
-from .clearance import ClearanceInfo, check_clearance as _check_clearance
+from .clearance import check_clearance as _check_clearance
 from .dfm import DfmExpectations, dfm_report as _dfm_report
 from .silhouette import SilhouetteComparison, silhouette_compare as _silhouette_compare
 from .units import UnitsReport, units_report as _units_report
-from .comparison import SignedField, _bounded_distances, compare, localized_change, signed_field
+from .comparison import (
+    _bounded_distances,
+    compare,
+    localized_change,
+    signed_field_and_scalars,
+)
 from .generative_validate import (
     ExtrudeExpectations,
     RevolveExpectations,
@@ -25,17 +31,23 @@ from .generative_validate import (
     validate_revolve as _validate_revolve,
 )
 from .remesh_validate import RemeshExpectations, validate_remesh as _validate_remesh
-from .symmetry import SymmetryInfo, detect_symmetry as _detect_symmetry
+from .symmetry import detect_symmetry as _detect_symmetry
 from .config import DEFAULT_RESOLUTION, VALIDATE_RESOLUTION
 from .errors import ErrorCode, MeshToolError
-from .features import DraftInfo, ThicknessInfo, draft_analysis, fit_region, wall_thickness
+from .features import (
+    draft_analysis,
+    draft_face_scalars,
+    fit_region,
+    thickness_vertex_scalars,
+    wall_thickness,
+)
 from .golden import compare_to_reference
 from .integrity import integrity_flags
 from .loading import load_mesh
 from .metrics import MeshMetrics, compute_metrics
 from .oracles import PropertySpec, run_oracles
 from .region import Region
-from .section import SectionInfo, inspect_section as _inspect_section
+from .section import inspect_section as _inspect_section, section_cut_faces
 from .rendering import (
     DEFAULT_VIEWS,
     highlight_face_colors,
@@ -79,6 +91,12 @@ silently PASSes):
   volume signature); measure_displacement (whole-mesh deformation field); validate_remesh.
 - check_clearance (assembly fit); compare_silhouette (outline preserved); units_sanity; validate_dfm.
 
+Most validators also return an inspectable render (a "photo"), and the key ones paint the
+checked quantity onto it — measure_displacement is a SIGNED heatmap (red = material added,
+blue = removed), measure_thickness a thin-wall heatmap, analyze_draft an undercut heatmap,
+inspect_section highlights the cut band, fit_feature the fitted region. Set include_render
+false in tight loops to save tokens.
+
 Rules of thumb:
 - All file paths must be ABSOLUTE; the server's working directory is not yours.
 - All numeric values (volume, distances, ...) are in the file's native units.
@@ -107,6 +125,27 @@ def _round(value: Any) -> Any:
 
 def _json(payload: dict[str, Any]) -> str:
     return json.dumps(_round(payload), separators=(",", ":"), allow_nan=False)
+
+
+def _with_render(
+    payload: dict[str, Any],
+    mesh: Any,
+    include_render: bool,
+    *,
+    face_colors: Any = None,
+    colorbar: Any = None,
+    views: tuple[str, ...] = DEFAULT_VIEWS,
+) -> list[str | Image]:
+    """Attach a render (optionally with a scalar/highlight overlay) to a JSON payload so every
+    validation can return a 'photo' the agent can inspect visually."""
+    if not include_render:
+        payload["render"] = {"included": False}
+        return [_json(payload)]
+    images, meta = render_views(
+        mesh, list(views), resolution=VALIDATE_RESOLUTION, face_colors=face_colors, colorbar=colorbar
+    )
+    payload["render"] = {"included": True, **meta}
+    return [_json(payload), *(Image(data=img, format="png") for img in images)]
 
 
 def _mesh_summary(metrics: MeshMetrics) -> dict[str, Any]:
@@ -390,7 +429,7 @@ def assert_properties(
     return [_json(payload), *(Image(data=img, format="png") for img in images)]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def inspect_section(
     file_path: Annotated[str, Field(description="Absolute path to the mesh file")],
     plane_origin: Annotated[
@@ -400,13 +439,24 @@ def inspect_section(
         list[float],
         Field(description="The cutting plane normal [x,y,z] (need not be unit)", min_length=3, max_length=3),
     ],
-) -> SectionInfo:
+    include_render: Annotated[
+        bool, Field(description="Append a render with the cut band highlighted")
+    ] = True,
+) -> list[str | Image]:
     """Slice the mesh with a plane and measure the resulting 2D profile: the number of loops,
     each loop's perimeter and area, and the net cross-section area (holes subtracted). Use it
     to check an extrusion's constant cross-section, a prism/cylinder's analytic area, or that
     a bore/pocket produced the intended profile. Area/perimeter are computed exactly from the
-    section polylines (no sampling)."""
-    return _inspect_section(load_mesh(file_path), plane_origin, plane_normal)
+    section polylines (no sampling); the render highlights where the plane cuts."""
+    loaded = load_mesh(file_path)
+    info = _inspect_section(loaded, plane_origin, plane_normal)
+    payload: dict[str, Any] = info.model_dump()
+    face_colors = None
+    if include_render and info.intersects:
+        cut = section_cut_faces(loaded.combined, plane_origin, plane_normal)
+        if len(cut):
+            face_colors = highlight_face_colors(loaded.combined, cut)
+    return _with_render(payload, loaded.combined, include_render, face_colors=face_colors)
 
 
 @mcp.tool(structured_output=False)
@@ -445,19 +495,31 @@ def compare_to_golden(
     return [_json(payload), *(Image(data=img, format="png") for img in images)]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def measure_thickness(
     file_path: Annotated[str, Field(description="Absolute path to a watertight mesh")],
     sample_count: Annotated[int, Field(description="Surface samples (500-8000)")] = 2000,
-) -> ThicknessInfo:
+    include_render: Annotated[
+        bool, Field(description="Append a thickness heatmap (thin walls in red)")
+    ] = True,
+) -> list[str | Image]:
     """Measure wall/feature thickness by inscribing the largest interior sphere at surface
-    samples. Reports min/p5/median/mean/max and the thinnest point. Use p5_thickness as the
-    robust thin-wall indicator (the bare min is biased low near sharp convex edges); use it
-    to verify a shell's min wall thickness. Requires a watertight mesh."""
-    return wall_thickness(load_mesh(file_path), sample_count)
+    samples. Reports min/p5/median/mean/max and the thinnest point; the render paints a
+    thickness heatmap so thin walls are visible (red = thin). Use p5_thickness as the robust
+    thin-wall indicator (the bare min is biased low near sharp convex edges). Watertight only."""
+    loaded = load_mesh(file_path)
+    info = wall_thickness(loaded, sample_count)
+    payload: dict[str, Any] = info.model_dump()
+    face_colors = colorbar = None
+    if include_render:
+        scalars = thickness_vertex_scalars(loaded)
+        face_colors, colorbar = scalars_to_face_colors(
+            loaded.combined, scalars, label="wall thickness (red = thin)", cmap="RdYlGn"
+        )
+    return _with_render(payload, loaded.combined, include_render, face_colors=face_colors, colorbar=colorbar)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def analyze_draft(
     file_path: Annotated[str, Field(description="Absolute path to the mesh")],
     pull_direction: Annotated[
@@ -468,12 +530,26 @@ def analyze_draft(
         float | None,
         Field(description="If set, also report the pullable area below this draft angle"),
     ] = None,
-) -> DraftInfo:
+    include_render: Annotated[
+        bool, Field(description="Append a draft heatmap (undercuts in red)")
+    ] = True,
+) -> list[str | Image]:
     """Area-weighted draft/undercut analysis for a pull direction: the minimum draft angle
-    over pullable faces, and the total area (and face count) of undercuts — faces whose
-    normal points against the pull and so cannot be released. Draft is 90deg minus the
-    angle between a face normal and the pull direction (0 = vertical wall)."""
-    return draft_analysis(load_mesh(file_path), pull_direction, min_draft_deg)
+    over pullable faces, and the total area (and face count) of undercuts — faces whose normal
+    points against the pull and so cannot be released. Draft is 90deg minus the angle between a
+    face normal and the pull direction (0 = vertical wall). The render paints draft per face so
+    undercuts (red) are visible."""
+    loaded = load_mesh(file_path)
+    info = draft_analysis(loaded, pull_direction, min_draft_deg)
+    payload: dict[str, Any] = info.model_dump()
+    face_colors = colorbar = None
+    if include_render:
+        scalars = draft_face_scalars(loaded, pull_direction)
+        face_colors, colorbar = scalars_to_face_colors(
+            loaded.combined, scalars, label="draft angle deg (red = undercut/low)",
+            cmap="RdYlGn", per_face=True,
+        )
+    return _with_render(payload, loaded.combined, include_render, face_colors=face_colors, colorbar=colorbar)
 
 
 @mcp.tool(structured_output=False)
@@ -490,13 +566,23 @@ def fit_feature(
         Literal["plane", "sphere", "cylinder"],
         Field(description="cylinder for a fillet/bore radius, plane for a chamfer, sphere for a dome"),
     ],
-) -> list[str]:
+    include_render: Annotated[
+        bool, Field(description="Append a render with the fitted feature region highlighted")
+    ] = True,
+) -> list[str | Image]:
     """Fit a primitive (plane/sphere/cylinder) to the vertices a region selects and report
     its parameters plus the RMS residual (the fit quality). This is how you measure a fillet
     or bore radius, or confirm a chamfer is planar: select the feature with a region, fit a
-    cylinder/plane, and read radius/normal + residual."""
-    fit = fit_region(load_mesh(file_path), region, kind)
-    return [_json(fit.model_dump())]
+    cylinder/plane, and read radius/normal + residual. The render highlights the region so you
+    can confirm you selected the right feature."""
+    loaded = load_mesh(file_path)
+    fit = fit_region(loaded, region, kind)
+    payload: dict[str, Any] = fit.model_dump()
+    face_colors = None
+    if include_render:
+        face_ids = np.nonzero(region.face_mask(loaded.combined))[0]
+        face_colors = highlight_face_colors(loaded.combined, face_ids)
+    return _with_render(payload, loaded.combined, include_render, face_colors=face_colors)
 
 
 @mcp.tool(structured_output=False)
@@ -535,31 +621,48 @@ def validate_boolean(
     return [_json(payload), *(Image(data=img, format="png") for img in images)]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def detect_symmetry(
     file_path: Annotated[str, Field(description="Absolute path to the mesh")],
     rel_tolerance: Annotated[
         float, Field(description="Symmetry tolerance as a fraction of the bbox diagonal")
     ] = 1e-3,
-) -> SymmetryInfo:
+    include_render: Annotated[bool, Field(description="Append a render of the part")] = True,
+) -> list[str | Image]:
     """Detect mirror and rotational self-symmetry. Reports the mirror planes (from the
     principal inertia axes, each confirmed by reflecting and measuring the surface distance)
     and the largest rotational fold about a principal axis. Use it to verify a part that
     should be symmetric actually is."""
-    return _detect_symmetry(load_mesh(file_path), rel_tolerance)
+    loaded = load_mesh(file_path)
+    info = _detect_symmetry(loaded, rel_tolerance)
+    return _with_render(info.model_dump(), loaded.combined, include_render)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def measure_displacement(
     file_a: Annotated[str, Field(description="Absolute path to the BEFORE mesh")],
     file_b: Annotated[str, Field(description="Absolute path to the AFTER mesh")],
-) -> SignedField:
+    include_render: Annotated[
+        bool, Field(description="Append a signed displacement heatmap of the after-mesh")
+    ] = True,
+) -> list[str | Image]:
     """Whole-mesh signed displacement field between before and after (the region-free
     deformation measure). Reports max/mean displacement, the signed peak along the surface
     normal (+ outward), the outward fraction, a direction-consistency score (1 = a coherent
-    offset, ~0 = tangential/twist), and the volume/area deltas. Use it to characterize a
-    deform/offset/morph over the whole part."""
-    return signed_field(load_mesh(file_a), load_mesh(file_b))
+    offset, ~0 = tangential/twist), and the volume/area deltas. The render is a SIGNED heatmap
+    of the after-mesh — red = material added (emboss/outward), blue = removed (pocket/inward) —
+    so you can see exactly where and which way the surface moved."""
+    la, lb = load_mesh(file_a), load_mesh(file_b)
+    field, outward = signed_field_and_scalars(la, lb)
+    payload: dict[str, Any] = field.model_dump()
+    face_colors = colorbar = None
+    if include_render:
+        face_colors, colorbar = scalars_to_face_colors(
+            lb.combined, outward,
+            label="signed displacement (red = added/outward, blue = removed/inward)",
+            cmap="RdBu_r", symmetric=True,
+        )
+    return _with_render(payload, lb.combined, include_render, face_colors=face_colors, colorbar=colorbar)
 
 
 @mcp.tool(structured_output=False)
@@ -573,12 +676,14 @@ def validate_array(
             "Polar: {kind:'polar', count, axis:[x,y,z], center:[x,y,z], angle_deg}."
         ),
     ],
-) -> list[str]:
+    include_render: Annotated[bool, Field(description="Append a render of the arrayed result")] = True,
+) -> list[str | Image]:
     """Validate a linear or polar array: the instance count, that every instance is congruent
     to the base (checked with the rigid invariants volume + principal inertia, no registration
     needed), and that the instances sit at the predicted grid/fan positions."""
-    report = _validate_array(load_mesh(file_result), load_mesh(file_base), pattern)
-    return [_json(report.model_dump())]
+    loaded_result = load_mesh(file_result)
+    report = _validate_array(loaded_result, load_mesh(file_base), pattern)
+    return _with_render(report.model_dump(), loaded_result.combined, include_render)
 
 
 @mcp.tool(structured_output=False)
@@ -598,7 +703,8 @@ def validate_generative(
     axis: Annotated[
         list[float], Field(description="Extrude axis [x,y,z]", min_length=3, max_length=3)
     ] = [0.0, 0.0, 1.0],
-) -> list[str]:
+    include_render: Annotated[bool, Field(description="Append a render of the result")] = True,
+) -> list[str | Image]:
     """Validate an extrude or revolve by its exact volumetric signature. Extrude: volume =
     profile_area x height and a constant cross-section along the axis. Revolve: volume =
     2*pi*profile_centroid_radius*profile_area (Pappus). Volume checks fail closed on a
@@ -625,7 +731,7 @@ def validate_generative(
                 profile_area=profile_area, profile_centroid_radius=profile_centroid_radius
             ),
         )
-    return [_json(report.model_dump())]
+    return _with_render(report.model_dump(), loaded.combined, include_render)
 
 
 @mcp.tool(structured_output=False)
@@ -641,35 +747,45 @@ def validate_remesh(
     min_triangle_quality: Annotated[
         float | None, Field(description="Optional floor on triangle quality (0=sliver, 1=equilateral)")
     ] = None,
-) -> list[str]:
+    include_render: Annotated[bool, Field(description="Append a render of the remeshed result")] = True,
+) -> list[str | Image]:
     """Validate a remesh/simplify/subdivide: the surface stayed within max_deviation of the
     original (bounded vertex-to-surface distance), the topology (watertight + genus) is
     unchanged, and triangle quality holds above an optional floor. One verdict for
     'retessellation didn't change the object'."""
+    loaded_after = load_mesh(file_after)
     report = _validate_remesh(
         load_mesh(file_before),
-        load_mesh(file_after),
+        loaded_after,
         RemeshExpectations(
             max_deviation=max_deviation,
             preserve_topology=preserve_topology,
             min_triangle_quality=min_triangle_quality,
         ),
     )
-    return [_json(report.model_dump())]
+    return _with_render(report.model_dump(), loaded_after.combined, include_render)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def check_clearance(
     file_a: Annotated[str, Field(description="Absolute path to part A")],
     file_b: Annotated[str, Field(description="Absolute path to part B")],
     min_clearance: Annotated[
         float | None, Field(description="If set, require at least this gap between the parts")
     ] = None,
-) -> ClearanceInfo:
+    include_render: Annotated[
+        bool, Field(description="Append a render of both parts together (one tint each)")
+    ] = True,
+) -> list[str | Image]:
     """Check whether two parts interfere and, if not, how close they come. Reports interference
     (with penetration depth for watertight parts) and the minimum surface-to-surface clearance.
-    Use it to verify an assembly fit or a required gap. Interference and clearance are sampled."""
-    return _check_clearance(load_mesh(file_a), load_mesh(file_b), min_clearance)
+    Use it to verify an assembly fit or a required gap. Interference and clearance are sampled;
+    the render shows both parts together (one tint each) so the fit is visible."""
+    la, lb = load_mesh(file_a), load_mesh(file_b)
+    info = _check_clearance(la, lb, min_clearance)
+    payload: dict[str, Any] = info.model_dump()
+    both = trimesh.util.concatenate([la.combined, lb.combined]) if include_render else None
+    return _with_render(payload, both, include_render)
 
 
 @mcp.tool()
@@ -724,7 +840,8 @@ def validate_dfm(
     check_trapped_voids: Annotated[
         bool, Field(description="Flag fully enclosed internal cavities")
     ] = True,
-) -> list[str]:
+    include_render: Annotated[bool, Field(description="Append a render of the part")] = True,
+) -> list[str | Image]:
     """Pure-geometry design-for-manufacturing check: composes minimum wall thickness, undercut
     area / draft angle for a pull direction, and a trapped-void (enclosed cavity) test into one
     verdict. This is geometric only (no materials/process model). Wall thickness uses the robust
@@ -736,8 +853,9 @@ def validate_dfm(
         max_undercut_area=max_undercut_area,
         check_trapped_voids=check_trapped_voids,
     )
-    report = _dfm_report(load_mesh(file_path), exp)
-    return [_json(report.model_dump())]
+    loaded = load_mesh(file_path)
+    report = _dfm_report(loaded, exp)
+    return _with_render(report.model_dump(), loaded.combined, include_render)
 
 
 def main() -> None:

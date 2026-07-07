@@ -29,7 +29,11 @@ write code → export mesh → validate_mesh → inspect report + renders → fi
   degenerate/sliver/duplicate/flipped faces, and triangle quality; defects that
   `is_watertight` alone would hide (and that silently corrupt the volume)
 - **Visual feedback** — labeled multi-view contact sheets with axis gizmos, returned as
-  images; failed integrity checks highlight the offending faces in red
+  images; failed integrity checks highlight the offending faces in red. Validators paint the
+  quantity they check onto the render: a **signed displacement heatmap** (red = material
+  added, blue = removed) for deformations, a thin-wall heatmap for thickness, a draft/undercut
+  heatmap, the cut band for a section, and the fitted region for a feature fit — so the agent
+  can confirm the manipulation *visually*, not just numerically
 - **Transform detection** — compares before/after meshes and classifies the change
   (`identical | translation | rotation | rigid | similarity | mirrored | deformed`),
   reporting translation vector, rotation axis/angle and uniform scale

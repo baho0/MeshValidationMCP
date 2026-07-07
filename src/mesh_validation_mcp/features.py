@@ -134,6 +134,26 @@ def draft_analysis(
     )
 
 
+def thickness_vertex_scalars(loaded: LoadedMesh) -> np.ndarray:
+    """Per-vertex inscribed-sphere thickness, for a wall-thickness heatmap (thin = low)."""
+    mesh = loaded.combined
+    return np.asarray(
+        trimesh.proximity.thickness(
+            mesh, np.asarray(mesh.vertices), exterior=False, method="max_sphere"
+        ),
+        dtype=float,
+    )
+
+
+def draft_face_scalars(loaded: LoadedMesh, pull_direction: list[float]) -> np.ndarray:
+    """Per-face draft angle (deg) for a draft/undercut heatmap; undercuts are negative."""
+    mesh = loaded.combined
+    pull = np.asarray(pull_direction, dtype=float)
+    pull = pull / (np.linalg.norm(pull) or 1.0)
+    cos_theta = np.clip(np.asarray(mesh.face_normals) @ pull, -1.0, 1.0)
+    return 90.0 - np.degrees(np.arccos(cos_theta))
+
+
 FeatureFit = Union[PlaneFit, SphereFit, CylinderFit]
 
 

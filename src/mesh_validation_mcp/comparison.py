@@ -517,13 +517,13 @@ class SignedField(BaseModel):
     caveats: list[str]
 
 
-def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
-    """Per-vertex signed displacement of B relative to A over the whole surface."""
-    a, b = loaded_a.combined, loaded_b.combined
+def _outward_field(
+    a: trimesh.Trimesh, b: trimesh.Trimesh
+) -> tuple[np.ndarray, np.ndarray, bool, Confidence, list[str]]:
+    """Per-(B-)vertex displacement magnitude and signed outward component (+ = material added).
+    Returns (displacement, outward, same_topology, confidence, caveats)."""
     diagonal = float(np.linalg.norm(a.extents)) or 1.0
-    tiny = 1e-6 * diagonal
     caveats: list[str] = []
-
     same_topology = len(a.vertices) == len(b.vertices) and np.array_equal(a.faces, b.faces)
     if same_topology:
         delta = np.asarray(b.vertices) - np.asarray(a.vertices)
@@ -538,8 +538,27 @@ def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
         else:
             outward = displacement.copy()
             caveats.append("before-mesh not watertight: outward sign unavailable")
-        conf = sampled("closest-point displacement (differing topology)", diagonal / np.sqrt(len(bverts)))
+        conf = sampled(
+            "closest-point displacement (differing topology)", diagonal / np.sqrt(len(bverts))
+        )
         caveats.append("topology differs: displacement measured to A's surface; approximate")
+    return displacement, outward, same_topology, conf, caveats
+
+
+def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
+    """Per-vertex signed displacement of B relative to A over the whole surface."""
+    return signed_field_and_scalars(loaded_a, loaded_b)[0]
+
+
+def signed_field_and_scalars(
+    loaded_a: LoadedMesh, loaded_b: LoadedMesh
+) -> tuple[SignedField, np.ndarray]:
+    """As signed_field, but also return the per-B-vertex signed outward array for rendering a
+    diverging displacement heatmap (+ outward/emboss, - inward/pocket)."""
+    a, b = loaded_a.combined, loaded_b.combined
+    diagonal = float(np.linalg.norm(a.extents)) or 1.0
+    tiny = 1e-6 * diagonal
+    displacement, outward, same_topology, conf, caveats = _outward_field(a, b)
 
     moved = displacement > tiny
     signed = _signed_displacement(outward[moved]) if moved.any() else _signed_displacement(np.array([]))
@@ -550,7 +569,7 @@ def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
         direction_consistency = 1.0
 
     va, vb = _finite_volume(a), _finite_volume(b)
-    return SignedField(
+    field = SignedField(
         same_topology=same_topology,
         max_displacement=float(displacement.max()) if displacement.size else 0.0,
         mean_displacement=float(displacement.mean()) if displacement.size else 0.0,
@@ -562,6 +581,7 @@ def signed_field(loaded_a: LoadedMesh, loaded_b: LoadedMesh) -> SignedField:
         confidence=conf,
         caveats=caveats,
     )
+    return field, outward
 
 
 def _finite_volume(mesh: trimesh.Trimesh) -> float | None:

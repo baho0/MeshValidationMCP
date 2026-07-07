@@ -106,13 +106,29 @@ def highlight_face_colors(mesh: trimesh.Trimesh, face_ids: np.ndarray) -> np.nda
 
 
 def scalars_to_face_colors(
-    mesh: trimesh.Trimesh, vertex_scalars: np.ndarray, label: str, cmap: str = "viridis"
+    mesh: trimesh.Trimesh,
+    scalars: np.ndarray,
+    label: str,
+    cmap: str = "viridis",
+    per_face: bool = False,
+    symmetric: bool = False,
 ) -> tuple[np.ndarray, ColorbarSpec]:
-    scalars = np.asarray(vertex_scalars, dtype=float)
-    vmin = float(np.nanmin(scalars))
-    vmax = float(np.nanmax(scalars))
+    """Map scalars to per-face colors + a colorbar spec.
+
+    ``per_face``: the scalars are already one-per-face (else one-per-vertex, averaged to faces).
+    ``symmetric``: normalize about zero (vmin=-M, vmax=+M) so a diverging colormap centers its
+    neutral colour at 0 — used for signed fields (e.g. outward vs inward displacement)."""
+    values = np.asarray(scalars, dtype=float)
+    finite = values[np.isfinite(values)]
+    if symmetric:
+        m = float(np.nanmax(np.abs(finite))) if finite.size else 1.0
+        vmin, vmax = -m, m
+    else:
+        vmin = float(np.nanmin(finite)) if finite.size else 0.0
+        vmax = float(np.nanmax(finite)) if finite.size else 1.0
     span = (vmax - vmin) or 1.0
-    face_values = ((scalars - vmin) / span)[mesh.faces].mean(axis=1)
+    normalized = np.nan_to_num((values - vmin) / span, nan=0.5)
+    face_values = normalized if per_face else normalized[mesh.faces].mean(axis=1)
     lut = colormaps[cmap](np.linspace(0.0, 1.0, 256))[:, :3]
     colors = lut[np.clip((face_values * 255).astype(int), 0, 255)]
     colorbar: ColorbarSpec = {
